@@ -19,6 +19,7 @@ REQUIRED_PATHS = [
     "app/context/examples.py",
     "app/schemas/__init__.py",
     "app/schemas/estimation.py",
+    "streamlit_app.py",
     ".env.example",
     ".gitignore",
     "pyproject.toml",
@@ -55,7 +56,7 @@ def test_env_example_documents_variables_without_secrets():
 
 def test_no_api_keys_hardcoded_in_code():
     key_pattern = re.compile(r"sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}")
-    for path in (PROJECT_ROOT / "app").rglob("*.py"):
+    for path in [*(PROJECT_ROOT / "app").rglob("*.py"), PROJECT_ROOT / "streamlit_app.py"]:
         assert not key_pattern.search(path.read_text()), f"Posible API key en {path}"
 
 

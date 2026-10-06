@@ -1,4 +1,4 @@
-"""Contratos de datos del endpoint de estimación."""
+"""Contratos de datos de los endpoints de estimación."""
 
 from datetime import datetime
 from typing import Literal
@@ -26,8 +26,9 @@ class TokenUsage(BaseModel):
     cached_input_tokens: int = 0
 
 
-class EstimationResponse(BaseModel):
-    estimation: str = Field(description="Estimación generada por el modelo, en Markdown")
+class EstimationMetadata(BaseModel):
+    """Métricas de una llamada. En streaming se envían en el evento final `done`."""
+
     model: str
     provider: Literal["openai", "anthropic"]
     usage: TokenUsage
@@ -38,3 +39,23 @@ class EstimationResponse(BaseModel):
     finish_reason: str
     truncated: bool = Field(description="True si la respuesta se cortó por el límite de tokens")
     created_at: datetime
+
+
+class EstimationResponse(EstimationMetadata):
+    estimation: str = Field(description="Estimación generada por el modelo, en Markdown")
+
+
+class ReferenceEstimation(BaseModel):
+    project: str
+    project_type: str
+    content: str = Field(description="Bloque en Markdown tal como se inyecta en el system prompt")
+
+
+class CAGContext(BaseModel):
+    """Contexto estático que recibe el modelo en cada llamada (para mostrarlo en la interfaz)."""
+
+    provider: Literal["openai", "anthropic"]
+    model: str
+    system_prompt: str
+    hourly_rates_eur: dict[str, int]
+    examples: list[ReferenceEstimation]
