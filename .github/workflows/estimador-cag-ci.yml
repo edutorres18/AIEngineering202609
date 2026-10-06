@@ -49,7 +49,9 @@ jobs:
           LLM_PROVIDER: openai
           APP_ENV: test
         run: |
-          uv run uvicorn app.main:app --port 8000 &
+          # uvicorn directo desde .venv (no "uv run") para no retener el lock de la caché de uv
+          .venv/bin/uvicorn app.main:app --port 8000 &
+          trap "kill $!" EXIT
           for i in $(seq 1 30); do curl -sf http://localhost:8000/health && break; sleep 1; done
           curl -sf http://localhost:8000/health
           curl -sf -o /dev/null http://localhost:8000/docs
@@ -75,6 +77,7 @@ jobs:
           fi
       - name: Arrancar servidor y evaluar una estimación real
         run: |
-          uv run uvicorn app.main:app --port 8000 &
+          .venv/bin/uvicorn app.main:app --port 8000 &
+          trap "kill $!" EXIT
           for i in $(seq 1 30); do curl -sf http://localhost:8000/health && break; sleep 1; done
           uv run python scripts/live_check.py --url http://localhost:8000
