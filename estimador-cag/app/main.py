@@ -19,9 +19,11 @@ logging.basicConfig(
 app = FastAPI(
     title="Estimador CAG",
     description=(
-        "Genera estimaciones de proyectos de software a partir de transcripciones de "
-        "reuniones con clientes. Arquitectura CAG: las estimaciones históricas de "
-        "referencia se inyectan en el prompt en cada llamada al LLM."
+        "Genera estimaciones de proyectos de software a partir de la descripción del proyecto "
+        "(o la transcripción de una reunión con el cliente) y de tres parámetros: tipo de "
+        "proyecto, nivel de detalle y formato. Arquitectura CAG: las estimaciones históricas "
+        "de referencia se inyectan en el prompt en cada llamada al LLM. El prompt sale de "
+        "plantillas Jinja2 versionadas."
     ),
     version="0.1.0",
 )
