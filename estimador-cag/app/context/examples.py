@@ -4,10 +4,16 @@ Son estimaciones históricas ficticias de la empresa. Se guardan como datos
 estructurados (no como texto libre) para que el servicio pueda normalizarlos y
 precalcular los campos derivados (costes y totales) antes de inyectarlos:
 el modelo no tiene que hacer aritmética para entender las referencias.
+La forma en que se presentan al modelo vive en la plantilla
+`app/prompts/estimation/<versión>/examples.j2`.
 
 Cuando el proyecto evolucione a RAG, esta capa se sustituirá por un servicio de
 búsqueda semántica sin que el resto del sistema cambie.
 """
+
+from functools import cache
+
+from app.schemas.estimation import ReferenceEstimation, ReferenceTask
 
 # Tarifas internas por perfil, en EUR/hora. Son la fuente de verdad para calcular costes.
 HOURLY_RATES_EUR: dict[str, int] = {
@@ -169,3 +175,34 @@ ESTIMATION_EXAMPLES: list[dict] = [
         ],
     },
 ]
+
+
+def build_reference_estimation(example: dict, rates: dict[str, int]) -> ReferenceEstimation:
+    """Calcula el coste de cada tarea (horas × tarifa del perfil) y los totales del ejemplo."""
+    tasks = [
+        ReferenceTask(
+            task=task["task"],
+            role=task["role"],
+            hours=task["hours"],
+            rate_eur=rates[task["role"]],
+            cost_eur=task["hours"] * rates[task["role"]],
+        )
+        for task in example["tasks"]
+    ]
+    return ReferenceEstimation(
+        project=example["project"],
+        project_type=example["project_type"],
+        meeting_summary=example["meeting_summary"],
+        tasks=tasks,
+        total_hours=sum(task.hours for task in tasks),
+        total_cost_eur=sum(task.cost_eur for task in tasks),
+        team=example["team"],
+        duration=example["duration"],
+        risks=example["risks"],
+    )
+
+
+@cache
+def reference_estimations() -> tuple[ReferenceEstimation, ...]:
+    """Las estimaciones de referencia listas para inyectar (se calculan una sola vez)."""
+    return tuple(build_reference_estimation(e, HOURLY_RATES_EUR) for e in ESTIMATION_EXAMPLES)

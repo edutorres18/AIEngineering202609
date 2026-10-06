@@ -1,7 +1,8 @@
 """Prueba end-to-end contra el servidor en marcha y con el LLM real.
 
-Envía una transcripción a POST /api/v1/estimate y evalúa la respuesta con
-comprobaciones deterministas (sin LLM juez): estructura, tarifas del contexto,
+Envía una transcripción como descripción a POST /api/v1/estimate, con el formato
+de desglose de tareas (line_items) y el nivel de detalle medio, y evalúa la respuesta
+con comprobaciones deterministas (sin LLM juez): estructura, tarifas del contexto,
 aritmética y uso de las referencias inyectadas.
 
 Uso:
@@ -29,6 +30,8 @@ REQUIRED_SECTIONS = [
     "### Referencia utilizada",
 ]
 DEFAULT_FILE = Path(__file__).resolve().parent.parent / "transcripciones/reunion_red_veterinaria.md"
+# Las comprobaciones de abajo son las del formato line_items (tabla de tareas con tarifas).
+PARAMETERS = {"project_type": "web_saas", "detail_level": "medium", "output_format": "line_items"}
 
 
 def parse_number(text: str) -> int | None:
@@ -97,24 +100,24 @@ def main() -> int:
     health = httpx.get(f"{args.url}/health", timeout=10)
     print(f"GET /health → {health.status_code} {health.json()}")
 
-    transcription = args.file.read_text(encoding="utf-8")
-    response = httpx.post(
-        f"{args.url}/api/v1/estimate", json={"transcription": transcription}, timeout=120
-    )
-    print(f"POST /api/v1/estimate → {response.status_code}")
+    payload = {"description": args.file.read_text(encoding="utf-8")} | PARAMETERS
+    response = httpx.post(f"{args.url}/api/v1/estimate", json=payload, timeout=120)
+    print(f"POST /api/v1/estimate {PARAMETERS} → {response.status_code}")
     if response.status_code != 200:
         print(response.text)
         return 1
     body = response.json()
 
-    print("\n" + body["estimation"] + "\n")
-    print(f"Proveedor/modelo: {body['provider']} / {body['model']}")
+    print("\n" + body["text"] + "\n")
+    print(
+        f"Prompt: {body['prompt_version']} | proveedor/modelo: {body['provider']} / {body['model']}"
+    )
     print(f"Tokens: {body['usage']} | latencia: {body['latency_ms']} ms")
     print(
         f"Coste aprox.: {body['estimated_cost_usd']} USD | finish_reason: {body['finish_reason']}"
     )
 
-    checks = evaluate(body["estimation"])
+    checks = evaluate(body["text"])
     checks["Respuesta no truncada"] = not body["truncated"]
     print("\nEvaluación determinista:")
     for name, ok in checks.items():

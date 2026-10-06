@@ -1,37 +1,64 @@
-"""Interfaz de chat del Estimador CAG con Streamlit.
+"""Interfaz del Estimador CAG con Streamlit: un formulario con parámetros tipados.
 
 Es un cliente HTTP de la API FastAPI: no importa el servicio de IA ni los SDK de los
 proveedores. El prompt, las API keys y el manejo de errores del LLM viven solo en el backend,
-así que este frontend se puede sustituir por otro sin tocarlo.
+así que este frontend se puede sustituir por otro sin tocarlo. Del backend solo reutiliza el
+contrato (app/schemas): el formulario produce exactamente el EstimationRequest que espera la API.
 
 Uso, con la API en marcha (make run):
     streamlit run streamlit_app.py      # o: make ui
 La URL de la API se cambia con la variable de entorno ESTIMADOR_API_URL.
 """
 
-import json
 import os
-import time
-from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 import httpx
 import streamlit as st
+from pydantic import ValidationError
+
+from app.schemas.estimation import DetailLevel, EstimationRequest, OutputFormat, ProjectType
 
 API_URL = os.environ.get("ESTIMADOR_API_URL", "http://localhost:8000")
-# La primera lectura espera al primer token del modelo; las siguientes, entre fragmentos.
+# La API responde cuando el modelo ha terminado la estimación completa.
 TIMEOUT = httpx.Timeout(5.0, read=120.0)
 SAMPLE_TRANSCRIPTION = Path(__file__).parent / "transcripciones" / "reunion_red_veterinaria.md"
-MAX_TRANSCRIPTION_CHARS = 50_000  # mismo límite que valida la API
-PREVIEW_CHARS = 300
-# Los límites los decide la API; aquí solo se traducen sus errores de validación de Pydantic.
+MAX_DESCRIPTION_CHARS = EstimationRequest.model_json_schema()["properties"]["description"][
+    "maxLength"
+]
+
+# Etiquetas de la interfaz; a la API viaja el valor del enum ("mobile_app", "summary"…).
+PROJECT_TYPES = {
+    ProjectType.MOBILE_APP: "App móvil",
+    ProjectType.WEB_SAAS: "Aplicación web / SaaS",
+    ProjectType.INTERNAL_TOOL: "Herramienta interna",
+    ProjectType.DATA_PIPELINE: "Pipeline de datos",
+}
+DETAIL_LEVELS = {
+    DetailLevel.SUMMARY: "Resumen",
+    DetailLevel.MEDIUM: "Medio",
+    DetailLevel.DETAILED: "Detallado",
+}
+OUTPUT_FORMATS = {
+    OutputFormat.PHASES_TABLE: "Tabla por fases",
+    OutputFormat.LINE_ITEMS: "Desglose de tareas",
+    OutputFormat.NARRATIVE: "Texto narrativo",
+}
+FORM_DEFAULTS = {
+    "description": "",
+    "project_type": ProjectType.WEB_SAAS,
+    "detail_level": DetailLevel.MEDIUM,
+    "output_format": OutputFormat.PHASES_TABLE,
+}
+
+# Los límites los define el contrato (EstimationRequest); aquí solo se traducen sus errores.
 VALIDATION_MESSAGES = {
     "string_too_short": (
-        "La transcripción es demasiado corta: escribe al menos {min_length} caracteres "
+        "La descripción es demasiado corta: escribe al menos {min_length} caracteres "
         "para que haya algo que estimar."
     ),
     "string_too_long": (
-        "La transcripción es demasiado larga: el máximo son {max_length} caracteres."
+        "La descripción es demasiado larga: el máximo son {max_length} caracteres."
     ),
 }
 
@@ -49,9 +76,13 @@ def _connection_error(exc: httpx.TransportError, base_url: httpx.URL) -> ApiErro
     return ApiError(f"No se pudo conectar con la API en {base_url}. ¿Está arrancada? (`make run`)")
 
 
-def _validation_message(error: dict) -> str:
-    template = VALIDATION_MESSAGES.get(error.get("type"))
-    return template.format(**error.get("ctx", {})) if template else error["msg"]
+def validation_message(errors: list[dict]) -> str:
+    """Errores de validación de Pydantic (locales o del 422 de la API) en lenguaje natural."""
+    messages = []
+    for error in errors:
+        template = VALIDATION_MESSAGES.get(error.get("type"))
+        messages.append(template.format(**error.get("ctx", {})) if template else error["msg"])
+    return "; ".join(messages)
 
 
 def error_message(response: httpx.Response) -> str:
@@ -61,29 +92,14 @@ def error_message(response: httpx.Response) -> str:
     except (ValueError, KeyError, TypeError):
         return f"La API respondió con un error HTTP {response.status_code}."
     if isinstance(detail, list):  # 422: errores de validación de Pydantic
-        return "; ".join(_validation_message(error) for error in detail)
+        return validation_message(detail)
     return str(detail)
 
 
-def parse_sse(lines: Iterable[str]) -> Iterator[tuple[str, dict]]:
-    """Agrupa las líneas de un stream text/event-stream en pares (evento, datos JSON)."""
-    event, data = "message", []
-    for line in lines:
-        if line.startswith("event:"):
-            event = line.removeprefix("event:").strip()
-        elif line.startswith("data:"):
-            data.append(line.removeprefix("data:").removeprefix(" "))
-        elif not line:  # una línea vacía cierra el evento
-            if data:
-                yield event, json.loads("\n".join(data))
-            event, data = "message", []
-        # el resto son comentarios (": ping" de keep-alive) y se ignoran
-
-
-def get_context(client: httpx.Client) -> dict:
-    """System prompt, tarifas y estimaciones de referencia que usa el backend."""
+def get_context(client: httpx.Client, params: dict[str, str]) -> dict:
+    """System prompt (para esos parámetros), tarifas y estimaciones de referencia."""
     try:
-        response = client.get("/api/v1/context")
+        response = client.get("/api/v1/context", params=params)
     except httpx.TransportError as exc:
         raise _connection_error(exc, client.base_url) from exc
     if response.status_code != 200:
@@ -91,42 +107,15 @@ def get_context(client: httpx.Client) -> dict:
     return response.json()
 
 
-def start_estimation(client: httpx.Client, transcription: str) -> httpx.Response:
-    """Envía la transcripción al endpoint de streaming y devuelve la respuesta abierta.
-
-    La API contesta cuando el modelo ya tiene el primer fragmento, así que los errores de
-    entrada (validación, API key, rate limit) llegan aquí como códigos HTTP.
-    """
-    request = client.build_request(
-        "POST", "/api/v1/estimate/stream", json={"transcription": transcription}
-    )
+def request_estimation(client: httpx.Client, request: EstimationRequest) -> dict:
+    """Envía el formulario a POST /api/v1/estimate y devuelve la EstimationResponse."""
     try:
-        response = client.send(request, stream=True)
+        response = client.post("/api/v1/estimate", json=request.model_dump(mode="json"))
     except httpx.TransportError as exc:
         raise _connection_error(exc, client.base_url) from exc
     if response.status_code != 200:
-        response.read()
-        response.close()
         raise ApiError(error_message(response))
-    return response
-
-
-def iter_estimation(response: httpx.Response, metrics: dict) -> Iterator[str]:
-    """Entrega el texto de la estimación según llega y deja en `metrics` los metadatos finales."""
-    try:
-        for event, data in parse_sse(response.iter_lines()):
-            if event == "delta":
-                yield data["text"]
-            elif event == "done":
-                metrics.update(data)
-                return
-            elif event == "error":
-                raise ApiError(data["detail"])
-    except httpx.TransportError as exc:
-        raise ApiError("Se perdió la conexión con la API durante la respuesta.") from exc
-    finally:
-        response.close()
-    raise ApiError("La respuesta de la API terminó sin completarse.")
+    return response.json()
 
 
 # --- Interfaz ---
@@ -142,113 +131,173 @@ def get_client() -> httpx.Client:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_context(_client: httpx.Client) -> dict:
-    return get_context(_client)
+def load_context(_client: httpx.Client, project_type: str, detail_level: str, output_format: str):
+    params = {
+        "project_type": project_type,
+        "detail_level": detail_level,
+        "output_format": output_format,
+    }
+    return get_context(_client, params)
 
 
-def read_chat_input(value) -> str:
-    """Texto escrito en el chat más el contenido de los ficheros adjuntos."""
-    parts = [value.text or ""]
-    parts += [file.getvalue().decode("utf-8", errors="replace") for file in value.files]
+def load_sample() -> None:
+    """Rellena el formulario con la transcripción de ejemplo (antes de pintar los widgets)."""
+    st.session_state.description = SAMPLE_TRANSCRIPTION.read_text(encoding="utf-8")
+    st.session_state.project_type = ProjectType.WEB_SAAS
+
+
+def read_description(text: str, file) -> str:
+    """Texto del formulario más el contenido del fichero adjunto, si lo hay."""
+    parts = [text, file.getvalue().decode("utf-8", errors="replace") if file else ""]
     return "\n\n".join(part.strip() for part in parts if part.strip())
 
 
-def last_metrics(messages: list[dict]) -> dict | None:
-    return next((m["metrics"] for m in reversed(messages) if m.get("metrics")), None)
+def render_form() -> dict | None:
+    """Pinta el formulario y, cuando se envía, devuelve sus valores."""
+    with st.form("estimation_form", border=True):
+        text = st.text_area(
+            "Descripción del proyecto",
+            key="description",
+            height=180,
+            max_chars=MAX_DESCRIPTION_CHARS,
+            placeholder=(
+                "Ej.: app móvil para que los socios de un gimnasio reserven clases, paguen la "
+                "cuota y reciban avisos. Ya tienen la marca y un backend con la lista de socios."
+            ),
+            help="Lo que hay que construir. También puedes pegar la transcripción de una reunión.",
+        )
+        file = st.file_uploader(
+            "…o adjunta la transcripción de una reunión", type=["txt", "md"], key="file"
+        )
+        left, right = st.columns(2)
+        project_type = left.selectbox(
+            "Tipo de proyecto",
+            options=list(PROJECT_TYPES),
+            format_func=PROJECT_TYPES.get,
+            key="project_type",
+        )
+        output_format = right.selectbox(
+            "Formato de salida",
+            options=list(OUTPUT_FORMATS),
+            format_func=OUTPUT_FORMATS.get,
+            key="output_format",
+        )
+        detail_level = st.pills(
+            "Nivel de detalle",
+            options=list(DETAIL_LEVELS),
+            format_func=DETAIL_LEVELS.get,
+            required=True,
+            key="detail_level",
+        )
+        if st.form_submit_button("Generar estimación", type="primary", icon=":material/calculate:"):
+            return {
+                "description": read_description(text, file),
+                "project_type": project_type,
+                "detail_level": detail_level,
+                "output_format": output_format,
+            }
+    return None
 
 
-def format_metrics(metrics: dict) -> str:
-    usage = metrics["usage"]
+def estimate(client: httpx.Client, fields: dict) -> dict:
+    """Valida el formulario con el contrato de la API, la llama y devuelve el resultado."""
+    result = {"response": None, "error": None}
+    try:
+        request = EstimationRequest(**fields)
+    except ValidationError as exc:  # se avisa sin gastar una petición
+        result["error"] = validation_message(exc.errors())
+        return result
+    with st.spinner("Estimando el proyecto…"):
+        try:
+            result["response"] = request_estimation(client, request)
+        except ApiError as exc:
+            result["error"] = str(exc)
+    return result
+
+
+def format_metrics(response: dict) -> str:
+    usage = response["usage"]
     parts = [
-        f"{metrics['provider']} / {metrics['model']}",
+        f"prompt {response['prompt_version']}",
+        f"{response['provider']} / {response['model']}",
         f"{_n(usage['input_tokens'])} tokens de entrada",
         f"{_n(usage['output_tokens'])} de salida",
-        f"{metrics['latency_ms'] / 1000:.1f} s",
+        f"{response['latency_ms'] / 1000:.1f} s",
     ]
-    if metrics["estimated_cost_usd"] is not None:
-        parts.append(f"~{metrics['estimated_cost_usd']:.4f} USD")
+    if response["estimated_cost_usd"] is not None:
+        parts.append(f"~{response['estimated_cost_usd']:.4f} USD")
     return " · ".join(parts)
 
 
-def render_transcription(text: str) -> None:
-    if len(text) <= PREVIEW_CHARS:
-        st.text(text)
+def render_result(result: dict) -> None:
+    if result["error"]:
+        st.error(result["error"], icon="⚠️")
         return
-    st.text(text[:PREVIEW_CHARS].rstrip() + " …")
-    with st.expander(f"Ver la transcripción completa ({_n(len(text))} caracteres)"):
-        st.text(text)
-
-
-def render_answer_footer(message: dict) -> None:
-    if message["error"]:
-        st.error(message["error"], icon="⚠️")
-    if metrics := message["metrics"]:
-        if metrics["truncated"]:
+    response = result["response"]
+    with st.container(border=True):
+        if response["truncated"]:
             st.warning(
                 "La estimación se cortó por el límite de tokens de salida (LLM_MAX_OUTPUT_TOKENS).",
                 icon="✂️",
             )
-        st.caption(format_metrics(metrics))
+        st.markdown(response["text"])
+        st.caption(format_metrics(response))
 
 
-def render_message(message: dict) -> None:
-    with st.chat_message(message["role"]):
-        if message["role"] == "user":
-            render_transcription(message["content"])
-        else:
-            if message["content"]:
-                st.markdown(message["content"])
-            render_answer_footer(message)
-
-
-def answer(client: httpx.Client, transcription: str) -> dict:
-    """Muestra la estimación en streaming y devuelve el mensaje para el historial."""
-    message = {"role": "assistant", "content": "", "metrics": None, "error": None}
-    metrics: dict = {}
-    start = time.perf_counter()
-    try:
-        with st.spinner("Analizando la transcripción…"):
-            response = start_estimation(client, transcription)
-        metrics["first_token_ms"] = int((time.perf_counter() - start) * 1000)
-        message["content"] = st.write_stream(iter_estimation(response, metrics))
-        message["metrics"] = metrics
-    except ApiError as exc:
-        # Un texto a medias se queda en pantalla, pero no en el historial: no es una estimación.
-        message["error"] = str(exc)
-    render_answer_footer(message)
-    return message
-
-
-def render_last_call(metrics: dict | None) -> None:
+def render_last_call(response: dict | None) -> None:
     st.subheader("Última llamada")
-    if not metrics:
-        st.caption("Todavía no hay ninguna estimación en esta conversación.")
+    if not response:
+        st.caption("Todavía no hay ninguna estimación.")
         return
-    usage = metrics["usage"]
-    st.markdown(f"Modelo: `{metrics['provider']} / {metrics['model']}`")
+    usage = response["usage"]
+    st.markdown(f"Modelo: `{response['provider']} / {response['model']}`")
     left, right = st.columns(2)
     left.metric("Tokens entrada", _n(usage["input_tokens"]))
     right.metric("Tokens salida", _n(usage["output_tokens"]))
-    left.metric("Tiempo total", f"{metrics['latency_ms'] / 1000:.1f} s")
-    right.metric("Primer token", f"{metrics['first_token_ms'] / 1000:.1f} s")
+    left.metric("Tiempo total", f"{response['latency_ms'] / 1000:.1f} s")
+    right.metric("Prompt", response["prompt_version"])
     details = [f"{_n(usage['cached_input_tokens'])} tokens de entrada cacheados"]
-    if metrics["estimated_cost_usd"] is not None:
-        details.append(f"coste aprox. {metrics['estimated_cost_usd']:.4f} USD")
+    if response["estimated_cost_usd"] is not None:
+        details.append(f"coste aprox. {response['estimated_cost_usd']:.4f} USD")
     st.caption(" · ".join(details))
+
+
+def format_reference(example: dict) -> str:
+    rows = [
+        f"| {task['task']} | {task['role']} | {task['hours']} | {_n(task['cost_eur'])} |"
+        for task in example["tasks"]
+    ]
+    return "\n".join(
+        [
+            example["meeting_summary"],
+            "",
+            "| Tarea | Perfil | Horas | Coste (EUR) |",
+            "| --- | --- | --: | --: |",
+            *rows,
+            f"| **Total** | | **{example['total_hours']}** | **{_n(example['total_cost_eur'])}** |",
+        ]
+    )
 
 
 def render_context(client: httpx.Client) -> None:
     st.subheader("Contexto CAG")
+    # Los widgets de un formulario solo cambian su valor al enviarlo: es lo último que se estimó.
+    state = st.session_state
     try:
-        context = load_context(client)
+        context = load_context(
+            client, state.project_type.value, state.detail_level.value, state.output_format.value
+        )
     except ApiError as exc:
         st.warning(str(exc), icon="🔌")
         return
     st.caption(
-        f"Lo que recibe el modelo en cada llamada · "
-        f"`{context['provider']} / {context['model']}` en {API_URL}"
+        f"Lo que recibe el modelo · `{context['provider']} / {context['model']}` en {API_URL}"
     )
-    with st.expander("System prompt activo"):
+    with st.expander(f"System prompt {context['prompt_version']}"):
+        st.caption(
+            f"{PROJECT_TYPES[state.project_type]} · {DETAIL_LEVELS[state.detail_level]} · "
+            f"{OUTPUT_FORMATS[state.output_format]}"
+        )
         st.code(context["system_prompt"], language="markdown", wrap_lines=True, height=400)
     with st.expander("Tarifas por perfil"):
         rows = [f"| {role} | {rate} |" for role, rate in context["hourly_rates_eur"].items()]
@@ -257,60 +306,38 @@ def render_context(client: httpx.Client) -> None:
     for example in context["examples"]:
         with st.expander(example["project"]):
             st.caption(example["project_type"])
-            st.code(example["content"], language="markdown", wrap_lines=True)
+            st.markdown(format_reference(example))
 
 
 def main() -> None:
     st.set_page_config(page_title="Estimador CAG", page_icon="📐", initial_sidebar_state=420)
-    st.session_state.setdefault("messages", [])
-    messages: list[dict] = st.session_state.messages
+    for key, value in FORM_DEFAULTS.items():
+        st.session_state.setdefault(key, value)
     client = get_client()
-
-    with st.sidebar:
-        # Se rellena al final, cuando la llamada de esta ejecución ya ha terminado.
-        last_call_box = st.container()
-        st.divider()
-        render_context(client)
 
     st.title("📐 Estimador de proyectos")
     st.caption(
-        "Pega la transcripción de una reunión con un cliente y recibe una estimación de "
-        "desarrollo. Cada mensaje se estima por separado."
+        "Describe el proyecto (o pega la transcripción de la reunión con el cliente), elige el "
+        "tipo, el formato y el nivel de detalle, y recibe una estimación de desarrollo."
+    )
+    st.button(
+        "Probar con una transcripción de ejemplo",
+        icon=":material/pets:",
+        type="tertiary",
+        on_click=load_sample,  # los callbacks se ejecutan antes de pintar el formulario
     )
 
-    for message in messages:
-        render_message(message)
+    if fields := render_form():
+        st.session_state.result = estimate(client, fields)
+        if response := st.session_state.result["response"]:
+            st.session_state.last_response = response
+    if result := st.session_state.get("result"):
+        render_result(result)
 
-    value = st.chat_input(
-        "Pega aquí la transcripción o adjunta un .txt / .md",
-        accept_file=True,
-        file_type=["txt", "md"],
-        max_chars=MAX_TRANSCRIPTION_CHARS,
-    )
-    transcription = read_chat_input(value) if value else ""
-    if not messages:
-        example_slot = st.empty()
-        if example_slot.button("Probar con una transcripción de ejemplo", icon=":material/pets:"):
-            transcription = SAMPLE_TRANSCRIPTION.read_text(encoding="utf-8")
-        if transcription:
-            example_slot.empty()
-
-    if transcription:
-        user_message = {"role": "user", "content": transcription}
-        messages.append(user_message)
-        render_message(user_message)
-        with st.chat_message("assistant"):
-            messages.append(answer(client, transcription))
-
-    with last_call_box:
-        st.button(
-            "Nueva conversación",
-            icon=":material/add_comment:",
-            width="stretch",
-            disabled=not messages,
-            on_click=messages.clear,  # los callbacks se ejecutan antes de la siguiente ejecución
-        )
-        render_last_call(last_metrics(messages))
+    with st.sidebar:
+        render_last_call(st.session_state.get("last_response"))
+        st.divider()
+        render_context(client)
 
 
 if __name__ == "__main__":

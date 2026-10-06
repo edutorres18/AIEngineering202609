@@ -40,7 +40,7 @@ jobs:
           uv run ruff check .
           uv run ruff format --check .
 
-      - name: Tests (estructura, prompt CAG, endpoints, streaming e interfaz con LLM simulado)
+      - name: Tests (estructura, plantillas de prompt, endpoints, streaming e interfaz con LLM simulado)
         run: uv run pytest -v
 
       - name: Smoke test (arranca la API y la interfaz Streamlit)
@@ -63,6 +63,9 @@ jobs:
           curl -sf -o /dev/null http://localhost:8000/docs
           curl -sf http://localhost:8000/openapi.json | grep -q '/api/v1/estimate/stream'
           curl -sf http://localhost:8000/api/v1/context | grep -q 'system_prompt'
+          # Las plantillas Jinja2 se cargan desde disco: un prompt renderizado con parámetros
+          curl -sf 'http://localhost:8000/api/v1/context?output_format=narrative&detail_level=detailed' \
+            | grep -q 'sin tablas ni listas'
           curl -sf http://localhost:8501/_stcore/health
 
   live:

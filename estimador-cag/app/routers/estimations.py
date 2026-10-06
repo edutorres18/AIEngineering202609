@@ -3,16 +3,20 @@
 import json
 from collections.abc import AsyncIterator
 from contextlib import aclosing
+from typing import Annotated
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 from fastapi.sse import format_sse_event
 
 from app.schemas.estimation import (
     CAGContext,
+    DetailLevel,
     EstimationMetadata,
     EstimationRequest,
     EstimationResponse,
+    OutputFormat,
+    ProjectType,
 )
 from app.services import llm_service
 from app.services.llm_service import LLMServiceError
@@ -30,7 +34,8 @@ Misma estimación que `POST /estimate`, enviada con Server-Sent Events a medida 
 
 Eventos (el campo `data` siempre es JSON):
 - `delta` → `{"text": "..."}`: siguiente fragmento del Markdown de la estimación.
-- `done` → metadatos de la llamada (modelo, tokens, coste, latencia, truncado). Cierra el stream.
+- `done` → metadatos de la llamada (versión del prompt, modelo, tokens, coste, latencia,
+  truncado). Cierra el stream.
 - `error` → `{"detail": "...", "status_code": 502}` si el proveedor falla con el stream ya empezado.
 
 Si el proveedor falla antes del primer fragmento, la respuesta es un error HTTP normal
@@ -74,11 +79,11 @@ async def _sse_stream(
 @router.post(
     "/estimate",
     response_model=EstimationResponse,
-    summary="Genera una estimación de software a partir de una transcripción de reunión",
+    summary="Genera una estimación de software a partir de la descripción del proyecto",
     responses=ERROR_RESPONSES,
 )
 async def estimate(request: EstimationRequest) -> EstimationResponse:
-    return await llm_service.generate_estimation(request.transcription)
+    return await llm_service.generate_estimation(request)
 
 
 @router.post(
@@ -89,7 +94,7 @@ async def estimate(request: EstimationRequest) -> EstimationResponse:
     responses=ERROR_RESPONSES,
 )
 async def estimate_stream(request: EstimationRequest) -> SSEResponse:
-    items = llm_service.stream_estimation(request.transcription)
+    items = llm_service.stream_estimation(request)
     # Se espera al primer fragmento antes de responder: si el proveedor falla de entrada
     # (API key, rate limit, timeout), el cliente recibe el código HTTP de error habitual.
     first = await anext(items)
@@ -103,6 +108,12 @@ async def estimate_stream(request: EstimationRequest) -> SSEResponse:
     "/context",
     response_model=CAGContext,
     summary="Contexto CAG que recibe el modelo: system prompt, tarifas y referencias",
+    description="El system prompt depende de los parámetros del formulario: se pueden indicar "
+    "aquí para ver el que recibe el modelo con cada combinación.",
 )
-async def context() -> CAGContext:
-    return llm_service.get_cag_context()
+async def context(
+    project_type: Annotated[ProjectType, Query()] = ProjectType.WEB_SAAS,
+    detail_level: Annotated[DetailLevel, Query()] = DetailLevel.MEDIUM,
+    output_format: Annotated[OutputFormat, Query()] = OutputFormat.PHASES_TABLE,
+) -> CAGContext:
+    return llm_service.get_cag_context(project_type, detail_level, output_format)

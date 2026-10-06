@@ -11,7 +11,7 @@ run: .env ## Arranca el servidor con recarga automática (PORT=8000 por defecto)
 	@echo "Swagger: http://localhost:$(PORT)/docs"
 	uv run uvicorn app.main:app --reload --port $(PORT)
 
-ui: ## Interfaz de chat Streamlit (necesita la API en marcha: make run)
+ui: ## Interfaz Streamlit con el formulario (necesita la API en marcha: make run)
 	ESTIMADOR_API_URL=$(ESTIMADOR_API_URL) uv run streamlit run streamlit_app.py --server.port $(UI_PORT)
 
 dev: .env ## Arranca la API y la interfaz a la vez (Ctrl+C para las dos)

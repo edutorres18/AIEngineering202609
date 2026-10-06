@@ -1,0 +1,35 @@
+{#
+  Ejemplos few-shot (estimaciones históricas de la empresa) que se incluyen en el system prompt.
+  Los datos vienen de app/context/examples.py con los costes y totales ya calculados: el modelo
+  no tiene que hacer aritmética para entenderlos.
+#}
+<examples>
+{% for example in reference_estimations %}
+<example number="{{ loop.index }}">
+<project_description>
+Tipo de proyecto: {{ example.project_type }}
+{{ example.meeting_summary }}
+</project_description>
+<estimation>
+## Estimación: {{ example.project }}
+### Desglose de tareas
+| Tarea | Perfil | Horas | Tarifa (EUR/h) | Coste (EUR) |
+| --- | --- | --- | --- | --- |
+{% for task in example.tasks %}
+| {{ task.task }} | {{ task.role }} | {{ task.hours }} | {{ task.rate_eur }} | {{ task.cost_eur | eur }} |
+{% endfor %}
+### Totales
+- Horas totales: {{ example.total_hours }} h
+- Coste total: {{ example.total_cost_eur | eur }} EUR
+### Equipo recomendado
+{{ example.team }}
+### Duración estimada
+{{ example.duration }}
+### Supuestos y riesgos
+{% for risk in example.risks %}
+- {{ risk }}
+{% endfor %}
+</estimation>
+</example>
+{% endfor %}
+</examples>

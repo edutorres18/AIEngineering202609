@@ -11,13 +11,20 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import app
+from app.prompts.loader import render_estimation_prompt, render_system_prompt
+from app.schemas.estimation import DetailLevel, EstimationRequest, OutputFormat, ProjectType
 from app.services import llm_service
-from app.services.llm_service import LLMResult, build_system_prompt
+from app.services.llm_service import LLMResult
 
-TRANSCRIPTION = (
-    "En la reunión con el equipo de marketing, el cliente explicó que necesita una landing "
-    "page con formulario de contacto e integración con HubSpot."
-)
+REQUEST = {
+    "description": (
+        "El equipo de marketing necesita una landing page con formulario de contacto e "
+        "integración con HubSpot."
+    ),
+    "project_type": "web_saas",
+    "detail_level": "medium",
+    "output_format": "line_items",
+}
 ESTIMATION = "## Estimación: Landing page\n### Desglose de tareas\n| Tarea | ... |"
 
 client = TestClient(app)
@@ -60,7 +67,7 @@ def test_stream_sends_deltas_then_done(monkeypatch):
     monkeypatch.setattr(
         llm_service, "_stream_openai", fake_stream(ESTIMATION[:20], ESTIMATION[20:], RESULT)
     )
-    response = client.post("/api/v1/estimate/stream", json={"transcription": TRANSCRIPTION})
+    response = client.post("/api/v1/estimate/stream", json=REQUEST)
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
@@ -68,6 +75,7 @@ def test_stream_sends_deltas_then_done(monkeypatch):
     assert [name for name, _ in events] == ["delta", "delta", "done"]
     assert "".join(data["text"] for name, data in events if name == "delta") == ESTIMATION
     done = events[-1][1]
+    assert done["prompt_version"] == "v1"
     assert done["provider"] == "openai"
     assert done["usage"] == {
         "input_tokens": 2000,
@@ -85,7 +93,7 @@ def test_stream_error_before_first_token_is_an_http_error(monkeypatch):
         body=None,
     )
     monkeypatch.setattr(llm_service, "_stream_openai", fake_stream(rate_limit))
-    response = client.post("/api/v1/estimate/stream", json={"transcription": TRANSCRIPTION})
+    response = client.post("/api/v1/estimate/stream", json=REQUEST)
 
     assert response.status_code == 503
     assert "Límite de peticiones" in response.json()["detail"]
@@ -93,7 +101,7 @@ def test_stream_error_before_first_token_is_an_http_error(monkeypatch):
 
 def test_stream_error_after_first_token_is_an_error_event(monkeypatch):
     monkeypatch.setattr(llm_service, "_stream_openai", fake_stream("## Estimación", api_error()))
-    response = client.post("/api/v1/estimate/stream", json={"transcription": TRANSCRIPTION})
+    response = client.post("/api/v1/estimate/stream", json=REQUEST)
 
     assert response.status_code == 200  # el stream ya había empezado
     assert sse_events(response.text) == [
@@ -107,7 +115,7 @@ def test_stream_without_text_is_an_error(monkeypatch):
         text="", finish_reason="completed", truncated=False, input_tokens=1, output_tokens=0
     )
     monkeypatch.setattr(llm_service, "_stream_openai", fake_stream(empty))
-    response = client.post("/api/v1/estimate/stream", json={"transcription": TRANSCRIPTION})
+    response = client.post("/api/v1/estimate/stream", json=REQUEST)
 
     assert response.status_code == 502
     assert "vacía" in response.json()["detail"]
@@ -115,17 +123,17 @@ def test_stream_without_text_is_an_error(monkeypatch):
 
 def test_stream_cut_by_the_provider_ends_with_an_error_event(monkeypatch):
     monkeypatch.setattr(llm_service, "_stream_openai", fake_stream("## Estimación"))
-    response = client.post("/api/v1/estimate/stream", json={"transcription": TRANSCRIPTION})
+    response = client.post("/api/v1/estimate/stream", json=REQUEST)
 
     name, data = sse_events(response.text)[-1]
     assert name == "error"
     assert "antes de terminarla" in data["detail"]
 
 
-def test_stream_rejects_too_short_transcription(monkeypatch):
+def test_stream_rejects_too_short_description(monkeypatch):
     calls = []
     monkeypatch.setattr(llm_service, "_stream_openai", lambda *args: calls.append(args))
-    response = client.post("/api/v1/estimate/stream", json={"transcription": "muy corta"})
+    response = client.post("/api/v1/estimate/stream", json=REQUEST | {"description": "corta"})
 
     assert response.status_code == 422
     assert calls == []  # no se gasta una llamada al LLM
@@ -138,16 +146,36 @@ def test_stream_endpoint_is_documented_as_sse():
 
 
 def test_context_exposes_the_same_prompt_the_model_receives():
-    response = client.get("/api/v1/context")
+    params = {
+        "project_type": "data_pipeline",
+        "detail_level": "detailed",
+        "output_format": "narrative",
+    }
+    response = client.get("/api/v1/context", params=params)
 
     assert response.status_code == 200
     body = response.json()
-    assert body["system_prompt"] == build_system_prompt()
+    system, _ = render_estimation_prompt(EstimationRequest(**REQUEST | params))
+    assert body["system_prompt"] == system
+    assert body["prompt_version"] == "v1"
     assert (body["provider"], body["model"]) == ("openai", "gpt-4o-mini")
     assert body["hourly_rates_eur"]["QA"] == 40
     assert len(body["examples"]) == 3
     for example in body["examples"]:
-        assert example["content"] in body["system_prompt"]
+        assert f"## Estimación: {example['project']}" in body["system_prompt"]
+        assert example["total_hours"] == sum(task["hours"] for task in example["tasks"])
+
+
+def test_context_defaults_match_the_form_defaults():
+    body = client.get("/api/v1/context").json()
+    expected = render_system_prompt(
+        ProjectType.WEB_SAAS, DetailLevel.MEDIUM, OutputFormat.PHASES_TABLE
+    )
+    assert body["system_prompt"] == expected
+
+
+def test_context_rejects_unknown_parameters():
+    assert client.get("/api/v1/context", params={"output_format": "pdf"}).status_code == 422
 
 
 # --- Normalización de los eventos de cada SDK ---
@@ -199,7 +227,8 @@ def fake_openai_client(monkeypatch, events) -> tuple[FakeOpenAIStream, list[dict
 
 
 async def collect(settings):
-    return [item async for item in llm_service.stream_estimation(TRANSCRIPTION, settings)]
+    request = EstimationRequest(**REQUEST)
+    return [item async for item in llm_service.stream_estimation(request, settings)]
 
 
 def test_openai_stream_yields_text_deltas_and_usage(monkeypatch):
@@ -296,6 +325,7 @@ def test_anthropic_stream_yields_text_deltas_and_usage(monkeypatch):
     assert metadata.provider == "anthropic"
     assert metadata.usage.input_tokens == 2100  # entrada sin cachear + leída de caché
     assert metadata.usage.cached_input_tokens == 2000
-    # El system prompt va como parámetro aparte y la transcripción como único mensaje
-    assert requests[0]["system"] == build_system_prompt()
-    assert [m["role"] for m in requests[0]["messages"]] == ["user"]
+    # El system prompt va como parámetro aparte y la descripción como único mensaje
+    system, user = render_estimation_prompt(EstimationRequest(**REQUEST))
+    assert requests[0]["system"] == system
+    assert requests[0]["messages"] == [{"role": "user", "content": user}]
