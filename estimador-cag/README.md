@@ -88,13 +88,25 @@ o Anthropic. `uv` instala Python 3.13 automáticamente si no lo tienes.
 
 ```bash
 cd estimador-cag
-uv sync
-cp .env.example .env   # completa OPENAI_API_KEY (o ANTHROPIC_API_KEY + LLM_PROVIDER=anthropic)
-uv run uvicorn app.main:app --reload
+make run   # la primera vez crea .env: completa OPENAI_API_KEY (o ANTHROPIC_API_KEY + LLM_PROVIDER=anthropic)
 ```
 
-- Swagger UI: http://localhost:8000/docs
+`make run` instala las dependencias (`uv sync`) y arranca `uvicorn app.main:app --reload`.
+Otro puerto: `make run PORT=9000`.
+
+- Swagger UI: http://localhost:8000/docs (también redirige desde `/`)
 - Health: `curl http://localhost:8000/health`
+
+| Comando | Qué hace |
+| --- | --- |
+| `make run` | Arranca el servidor con recarga automática (target por defecto) |
+| `make test` | Tests con el LLM simulado (sin coste) |
+| `make lint` | Lint y formato con ruff |
+| `make format` | Formatea el código y aplica arreglos automáticos |
+| `make live` | Estimación real + evaluación determinista (con el servidor en marcha) |
+| `make help` | Lista los comandos |
+
+Sin `make`, los equivalentes son `uv run uvicorn app.main:app --reload`, `uv run pytest`, etc.
 
 Ejemplo de petición:
 
@@ -128,14 +140,14 @@ gestión y recordatorios por WhatsApp). Incluye charla irrelevante a propósito,
 que el modelo la ignora. Para estimarla y evaluar el resultado con el servidor en marcha:
 
 ```bash
-uv run python scripts/live_check.py
+make live
 ```
 
 ## Tests y validación automática
 
 ```bash
-uv run pytest        # estructura, prompt CAG y endpoints con el LLM simulado (sin coste)
-uv run ruff check .  # lint
+make test   # estructura, prompt CAG y endpoints con el LLM simulado (sin coste)
+make lint   # lint y formato
 ```
 
 - `tests/test_structure.py`: la estructura de carpetas es la del ejercicio, `.env` está en
