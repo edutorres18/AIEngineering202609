@@ -1,0 +1,11 @@
+# Secretos: nunca versionar
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[oc]
+.venv/
+.pytest_cache/
+.ruff_cache/
