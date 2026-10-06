@@ -1,0 +1,80 @@
+name: estimador-cag CI
+
+on:
+  push:
+    paths:
+      - "estimador-cag/**"
+      - ".github/workflows/estimador-cag-ci.yml"
+  pull_request:
+    paths:
+      - "estimador-cag/**"
+      - ".github/workflows/estimador-cag-ci.yml"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: estimador-cag
+
+jobs:
+  validate:
+    name: Estructura, tests y arranque del servicio
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ningún .env versionado
+        run: |
+          if git ls-files | grep -E '(^|/)\.env$'; then
+            echo "::error::Hay un archivo .env versionado"; exit 1
+          fi
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Instalar dependencias
+        run: uv sync --locked
+
+      - name: Lint y formato
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Tests (estructura, prompt CAG y endpoints con LLM simulado)
+        run: uv run pytest -v
+
+      - name: Smoke test (arranca uvicorn y prueba /health y /docs)
+        env:
+          OPENAI_API_KEY: sk-ci-dummy
+          LLM_PROVIDER: openai
+          APP_ENV: test
+        run: |
+          uv run uvicorn app.main:app --port 8000 &
+          for i in $(seq 1 30); do curl -sf http://localhost:8000/health && break; sleep 1; done
+          curl -sf http://localhost:8000/health
+          curl -sf -o /dev/null http://localhost:8000/docs
+          curl -sf http://localhost:8000/openapi.json | grep -q '/api/v1/estimate'
+
+  live:
+    name: Prueba end-to-end con el LLM real (manual)
+    needs: validate
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      LLM_PROVIDER: openai
+      LOG_LEVEL: INFO
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - name: Comprobar secreto
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::Configura el secreto OPENAI_API_KEY en el repositorio"; exit 1
+          fi
+      - name: Arrancar servidor y evaluar una estimación real
+        run: |
+          uv run uvicorn app.main:app --port 8000 &
+          for i in $(seq 1 30); do curl -sf http://localhost:8000/health && break; sleep 1; done
+          uv run python scripts/live_check.py --url http://localhost:8000

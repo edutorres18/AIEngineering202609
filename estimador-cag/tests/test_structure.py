@@ -1,0 +1,63 @@
+"""Valida que el scaffolding respeta la estructura pedida en el ejercicio."""
+
+import re
+from pathlib import Path
+
+import pytest
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+REQUIRED_PATHS = [
+    "app/__init__.py",
+    "app/main.py",
+    "app/config.py",
+    "app/routers/__init__.py",
+    "app/routers/estimations.py",
+    "app/services/__init__.py",
+    "app/services/llm_service.py",
+    "app/context/__init__.py",
+    "app/context/examples.py",
+    "app/schemas/__init__.py",
+    "app/schemas/estimation.py",
+    ".env.example",
+    ".gitignore",
+    "pyproject.toml",
+    "README.md",
+]
+
+REQUIRED_ENV_VARS = [
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "LLM_PROVIDER",
+    "LLM_MODEL",
+    "APP_ENV",
+    "LOG_LEVEL",
+]
+
+
+@pytest.mark.parametrize("relative_path", REQUIRED_PATHS)
+def test_required_path_exists(relative_path):
+    assert (PROJECT_ROOT / relative_path).is_file(), f"Falta {relative_path}"
+
+
+def test_env_is_gitignored():
+    patterns = (PROJECT_ROOT / ".gitignore").read_text().splitlines()
+    assert ".env" in patterns
+
+
+def test_env_example_documents_variables_without_secrets():
+    content = (PROJECT_ROOT / ".env.example").read_text()
+    for var in REQUIRED_ENV_VARS:
+        assert re.search(rf"^{var}=", content, re.MULTILINE), f"{var} no está en .env.example"
+    for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        assert re.search(rf"^{key}=$", content, re.MULTILINE), f"{key} no debe tener valor"
+
+
+def test_no_api_keys_hardcoded_in_code():
+    key_pattern = re.compile(r"sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}")
+    for path in (PROJECT_ROOT / "app").rglob("*.py"):
+        assert not key_pattern.search(path.read_text()), f"Posible API key en {path}"
+
+
+def test_at_least_one_meeting_transcription():
+    assert any((PROJECT_ROOT / "transcripciones").glob("*.md"))
