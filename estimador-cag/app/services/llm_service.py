@@ -4,10 +4,15 @@ Estructura de mensajes (CAG, single-turn):
     [system]    → instrucciones + tarifas + estimaciones de referencia + reglas
     [user]      → transcripción de la reunión a estimar
     [assistant] → estimación generada por el modelo
+
+La estimación se puede pedir completa (generate_estimation) o en streaming
+(stream_estimation); ambas usan el mismo prompt, los mismos errores y las mismas métricas.
 """
 
 import logging
 import time
+from collections.abc import AsyncIterator, Iterator
+from contextlib import aclosing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -17,7 +22,13 @@ import openai
 
 from app.config import Settings, get_settings
 from app.context.examples import ESTIMATION_EXAMPLES, HOURLY_RATES_EUR
-from app.schemas.estimation import EstimationResponse, TokenUsage
+from app.schemas.estimation import (
+    CAGContext,
+    EstimationMetadata,
+    EstimationResponse,
+    ReferenceEstimation,
+    TokenUsage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +178,25 @@ def build_system_prompt() -> str:
     )
 
 
+def get_cag_context(settings: Settings | None = None) -> CAGContext:
+    """Contexto estático que recibe el modelo, para mostrarlo en la interfaz."""
+    settings = settings or get_settings()
+    return CAGContext(
+        provider=settings.LLM_PROVIDER,
+        model=settings.LLM_MODEL,
+        system_prompt=build_system_prompt(),
+        hourly_rates_eur=HOURLY_RATES_EUR,
+        examples=[
+            ReferenceEstimation(
+                project=example["project"],
+                project_type=example["project_type"],
+                content=format_example(example, HOURLY_RATES_EUR),
+            )
+            for example in ESTIMATION_EXAMPLES
+        ],
+    )
+
+
 def build_messages(transcription: str) -> list[dict[str, str]]:
     user_content = (
         "Transcripción de la reunión a estimar:\n\n"
@@ -198,17 +228,19 @@ def _anthropic_client() -> anthropic.AsyncAnthropic:
     )
 
 
-async def _call_openai(settings: Settings, messages: list[dict[str, str]]) -> LLMResult:
-    optional = {}
+def _openai_request(settings: Settings, messages: list[dict[str, str]]) -> dict:
+    request = {
+        "model": settings.LLM_MODEL,
+        "input": messages,
+        "max_output_tokens": settings.LLM_MAX_OUTPUT_TOKENS,
+        "store": False,  # no guardar transcripciones de clientes en OpenAI
+    }
     if settings.LLM_TEMPERATURE is not None:
-        optional["temperature"] = settings.LLM_TEMPERATURE
-    response = await _openai_client().responses.create(
-        model=settings.LLM_MODEL,
-        input=messages,
-        max_output_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
-        store=False,  # no guardar transcripciones de clientes en OpenAI
-        **optional,
-    )
+        request["temperature"] = settings.LLM_TEMPERATURE
+    return request
+
+
+def _openai_result(response) -> LLMResult:
     reason = response.status or "unknown"
     if response.status == "incomplete" and response.incomplete_details:
         reason = response.incomplete_details.reason or reason
@@ -224,28 +256,70 @@ async def _call_openai(settings: Settings, messages: list[dict[str, str]]) -> LL
     )
 
 
-async def _call_anthropic(settings: Settings, messages: list[dict[str, str]]) -> LLMResult:
-    # Anthropic recibe el system prompt como parámetro aparte, fuera del array de mensajes.
-    system = next(m["content"] for m in messages if m["role"] == "system")
-    conversation = [m for m in messages if m["role"] != "system"]
-    response = await _anthropic_client().messages.create(
-        model=settings.LLM_MODEL,
-        max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
-        system=system,
-        messages=conversation,
+async def _call_openai(settings: Settings, messages: list[dict[str, str]]) -> LLMResult:
+    response = await _openai_client().responses.create(**_openai_request(settings, messages))
+    return _openai_result(response)
+
+
+async def _stream_openai(
+    settings: Settings, messages: list[dict[str, str]]
+) -> AsyncIterator[str | LLMResult]:
+    """Produce los fragmentos de texto y, al final, el resultado completo con el uso de tokens."""
+    stream = await _openai_client().responses.create(
+        **_openai_request(settings, messages), stream=True
     )
-    usage = response.usage
+    async with stream:
+        async for event in stream:
+            if event.type == "response.output_text.delta":
+                yield event.delta
+            elif event.type in ("response.completed", "response.incomplete"):
+                yield _openai_result(event.response)
+            elif event.type in ("response.failed", "error"):
+                # Solo el código: el evento completo incluye texto generado a partir del cliente.
+                error = event.response.error if event.type == "response.failed" else event
+                logger.error("OpenAI interrumpió el stream (code=%s)", getattr(error, "code", None))
+                raise LLMServiceError("El proveedor LLM interrumpió la respuesta")
+
+
+def _anthropic_request(settings: Settings, messages: list[dict[str, str]]) -> dict:
+    # Anthropic recibe el system prompt como parámetro aparte, fuera del array de mensajes.
+    return {
+        "model": settings.LLM_MODEL,
+        "max_tokens": settings.LLM_MAX_OUTPUT_TOKENS,
+        "system": next(m["content"] for m in messages if m["role"] == "system"),
+        "messages": [m for m in messages if m["role"] != "system"],
+    }
+
+
+def _anthropic_result(message) -> LLMResult:
+    usage = message.usage
     cache_read = usage.cache_read_input_tokens or 0
     cache_write = usage.cache_creation_input_tokens or 0
-    reason = response.stop_reason or "unknown"
+    reason = message.stop_reason or "unknown"
     return LLMResult(
-        text="".join(block.text for block in response.content if block.type == "text"),
+        text="".join(block.text for block in message.content if block.type == "text"),
         finish_reason=reason,
         truncated=reason == "max_tokens",
         input_tokens=usage.input_tokens + cache_read + cache_write,
         output_tokens=usage.output_tokens,
         cached_input_tokens=cache_read,
     )
+
+
+async def _call_anthropic(settings: Settings, messages: list[dict[str, str]]) -> LLMResult:
+    response = await _anthropic_client().messages.create(**_anthropic_request(settings, messages))
+    return _anthropic_result(response)
+
+
+async def _stream_anthropic(
+    settings: Settings, messages: list[dict[str, str]]
+) -> AsyncIterator[str | LLMResult]:
+    """Produce los fragmentos de texto y, al final, el resultado completo con el uso de tokens."""
+    request = _anthropic_request(settings, messages)
+    async with _anthropic_client().messages.stream(**request) as stream:
+        async for text in stream.text_stream:
+            yield text
+        yield _anthropic_result(await stream.get_final_message())
 
 
 def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
@@ -256,24 +330,11 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
     return round((input_tokens * input_price + output_tokens * output_price) / 1_000_000, 6)
 
 
-async def generate_estimation(
-    transcription: str, settings: Settings | None = None
-) -> EstimationResponse:
-    settings = settings or get_settings()
-    provider = settings.LLM_PROVIDER
-    messages = build_messages(transcription)
-    call = _call_openai if provider == "openai" else _call_anthropic
-    logger.debug(
-        "Llamando a %s/%s (system=%d chars, transcripción=%d chars)",
-        provider,
-        settings.LLM_MODEL,
-        len(messages[0]["content"]),
-        len(transcription),
-    )
-
-    start = time.perf_counter()
+@contextmanager
+def _provider_errors(provider: str) -> Iterator[None]:
+    """Traduce las excepciones de los SDK a LLMServiceError sin exponer detalles internos."""
     try:
-        result = await call(settings, messages)
+        yield
     except (openai.APITimeoutError, anthropic.APITimeoutError) as exc:
         logger.warning("Timeout del proveedor %s", provider)
         raise LLMServiceError("El proveedor LLM no respondió a tiempo", status_code=504) from exc
@@ -289,8 +350,24 @@ async def generate_estimation(
     except (openai.APIError, anthropic.APIError) as exc:
         logger.exception("Error del proveedor %s", provider)
         raise LLMServiceError("Error al llamar al proveedor LLM") from exc
-    latency_ms = int((time.perf_counter() - start) * 1000)
 
+
+def _log_request(settings: Settings, messages: list[dict[str, str]], *, streaming: bool) -> None:
+    logger.debug(
+        "Llamando a %s/%s (system=%d chars, transcripción=%d chars, streaming=%s)",
+        settings.LLM_PROVIDER,
+        settings.LLM_MODEL,
+        len(messages[0]["content"]),
+        len(messages[1]["content"]),
+        streaming,
+    )
+
+
+def _build_metadata(
+    settings: Settings, result: LLMResult, start: float, *, streaming: bool
+) -> EstimationMetadata:
+    """Valida el resultado, registra las métricas de la llamada y las devuelve."""
+    latency_ms = int((time.perf_counter() - start) * 1000)
     if not result.text.strip():
         raise LLMServiceError("El proveedor LLM devolvió una respuesta vacía")
     if result.truncated:
@@ -299,21 +376,20 @@ async def generate_estimation(
             settings.LLM_MAX_OUTPUT_TOKENS,
         )
     logger.info(
-        "Estimación generada provider=%s model=%s input_tokens=%d output_tokens=%d "
-        "cached_tokens=%d latency_ms=%d finish_reason=%s",
-        provider,
+        "Estimación generada provider=%s model=%s streaming=%s input_tokens=%d "
+        "output_tokens=%d cached_tokens=%d latency_ms=%d finish_reason=%s",
+        settings.LLM_PROVIDER,
         settings.LLM_MODEL,
+        streaming,
         result.input_tokens,
         result.output_tokens,
         result.cached_input_tokens,
         latency_ms,
         result.finish_reason,
     )
-
-    return EstimationResponse(
-        estimation=result.text,
+    return EstimationMetadata(
         model=settings.LLM_MODEL,
-        provider=provider,
+        provider=settings.LLM_PROVIDER,
         usage=TokenUsage(
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
@@ -327,3 +403,46 @@ async def generate_estimation(
         truncated=result.truncated,
         created_at=datetime.now(UTC),
     )
+
+
+async def generate_estimation(
+    transcription: str, settings: Settings | None = None
+) -> EstimationResponse:
+    settings = settings or get_settings()
+    messages = build_messages(transcription)
+    call = _call_openai if settings.LLM_PROVIDER == "openai" else _call_anthropic
+    _log_request(settings, messages, streaming=False)
+
+    start = time.perf_counter()
+    with _provider_errors(settings.LLM_PROVIDER):
+        result = await call(settings, messages)
+    metadata = _build_metadata(settings, result, start, streaming=False)
+    return EstimationResponse(**metadata.model_dump(), estimation=result.text)
+
+
+async def stream_estimation(
+    transcription: str, settings: Settings | None = None
+) -> AsyncIterator[str | EstimationMetadata]:
+    """Como generate_estimation, pero entrega el texto a medida que el modelo lo genera.
+
+    Produce fragmentos de texto (str) y, al terminar, un único EstimationMetadata.
+    """
+    settings = settings or get_settings()
+    messages = build_messages(transcription)
+    stream = _stream_openai if settings.LLM_PROVIDER == "openai" else _stream_anthropic
+    _log_request(settings, messages, streaming=True)
+
+    start = time.perf_counter()
+    result = None
+    with _provider_errors(settings.LLM_PROVIDER):
+        # aclosing: si el cliente abandona el stream, se cierra también la conexión con el proveedor
+        async with aclosing(stream(settings, messages)) as items:
+            async for item in items:
+                if isinstance(item, LLMResult):
+                    result = item
+                elif item:
+                    yield item
+    if result is None:  # el stream terminó sin el evento final con el uso de tokens
+        logger.error("El stream de %s terminó sin completarse", settings.LLM_PROVIDER)
+        raise LLMServiceError("El proveedor LLM cortó la respuesta antes de terminarla")
+    yield _build_metadata(settings, result, start, streaming=True)
