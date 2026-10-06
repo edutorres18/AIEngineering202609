@@ -42,6 +42,12 @@ def test_health():
     assert response.json()["status"] == "ok"
 
 
+def test_root_redirects_to_docs():
+    response = client.get("/", follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["location"] == "/docs"
+
+
 def test_swagger_docs_available():
     assert client.get("/docs").status_code == 200
     assert "/api/v1/estimate" in client.get("/openapi.json").json()["paths"]
