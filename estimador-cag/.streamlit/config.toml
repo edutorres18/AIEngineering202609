@@ -1,0 +1,7 @@
+[browser]
+# No enviar estadísticas de uso a Streamlit
+gatherUsageStats = false
+
+[server]
+# No pedir un email en el primer arranque (bloquearía "make dev")
+showEmailPrompt = false

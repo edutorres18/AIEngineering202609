@@ -40,22 +40,30 @@ jobs:
           uv run ruff check .
           uv run ruff format --check .
 
-      - name: Tests (estructura, prompt CAG y endpoints con LLM simulado)
+      - name: Tests (estructura, prompt CAG, endpoints, streaming e interfaz con LLM simulado)
         run: uv run pytest -v
 
-      - name: Smoke test (arranca uvicorn y prueba /health y /docs)
+      - name: Smoke test (arranca la API y la interfaz Streamlit)
         env:
           OPENAI_API_KEY: sk-ci-dummy
           LLM_PROVIDER: openai
           APP_ENV: test
         run: |
-          # uvicorn directo desde .venv (no "uv run") para no retener el lock de la caché de uv
+          # Binarios directos desde .venv (no "uv run") para no retener el lock de la caché de uv
           .venv/bin/uvicorn app.main:app --port 8000 &
-          trap "kill $!" EXIT
-          for i in $(seq 1 30); do curl -sf http://localhost:8000/health && break; sleep 1; done
+          API_PID=$!
+          .venv/bin/streamlit run streamlit_app.py --server.headless true --server.port 8501 &
+          UI_PID=$!
+          trap "kill $API_PID $UI_PID" EXIT
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health && curl -sf http://localhost:8501/_stcore/health && break
+            sleep 1
+          done
           curl -sf http://localhost:8000/health
           curl -sf -o /dev/null http://localhost:8000/docs
-          curl -sf http://localhost:8000/openapi.json | grep -q '/api/v1/estimate'
+          curl -sf http://localhost:8000/openapi.json | grep -q '/api/v1/estimate/stream'
+          curl -sf http://localhost:8000/api/v1/context | grep -q 'system_prompt'
+          curl -sf http://localhost:8501/_stcore/health
 
   live:
     name: Prueba end-to-end con el LLM real (manual)

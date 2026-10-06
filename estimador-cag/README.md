@@ -9,16 +9,22 @@ Es el Proyecto 1 del programa AI Engineering 2026/09 (LIDR), en su primera fase:
 (tarifas y estimaciones históricas de la empresa) viaja en cada llamada. No hay base de datos,
 ni retrieval, ni persistencia.
 
+Desde la sesión 3 incluye una **interfaz de chat con Streamlit** ([`streamlit_app.py`](streamlit_app.py)):
+se pega la transcripción y la estimación aparece en streaming, token a token, con el contexto CAG
+y las métricas de la llamada en el panel lateral. Ver [Interfaz de chat](#interfaz-de-chat-streamlit).
+
 ## Arquitectura
 
 ```mermaid
 flowchart LR
+    U[streamlit_app.py<br/>chat Streamlit] -->|POST /api/v1/estimate/stream<br/>SSE| R
+    U -->|GET /api/v1/context| R
     C[Cliente<br/>curl / Swagger] -->|POST /api/v1/estimate| R[routers/estimations.py<br/>valida con Pydantic]
     R --> S[services/llm_service.py<br/>construye el prompt CAG]
     X[context/examples.py<br/>tarifas + estimaciones históricas] --> S
     S -->|system + user| L[(LLM<br/>OpenAI / Anthropic)]
-    L --> S
-    S -->|EstimationResponse| R --> C
+    L -->|completa o en streaming| S
+    S --> R
 ```
 
 | Capa | Archivo | Responsabilidad |
@@ -29,6 +35,14 @@ flowchart LR
 | Negocio | `app/services/llm_service.py` | Preprocesa el contexto, arma los mensajes, llama al proveedor y normaliza la respuesta |
 | Contratos | `app/schemas/estimation.py` | Request/response con Pydantic (documentados en Swagger) |
 | Contexto CAG | `app/context/examples.py` | Tarifas por perfil y 3 estimaciones históricas ficticias |
+| Interfaz | `streamlit_app.py` | Chat Streamlit: cliente HTTP de la API, sin lógica de IA |
+
+| Endpoint | Qué hace |
+| --- | --- |
+| `POST /api/v1/estimate` | Estimación completa en JSON (`EstimationResponse`) |
+| `POST /api/v1/estimate/stream` | La misma estimación en streaming con Server-Sent Events |
+| `GET /api/v1/context` | System prompt, tarifas y estimaciones de referencia (lo que ve el modelo) |
+| `GET /health` | Estado, entorno, proveedor y modelo activos |
 
 Estructura de mensajes enviada al modelo:
 
@@ -61,6 +75,9 @@ Estructura de mensajes enviada al modelo:
   campos de uso, `finish_reason`) se normalizan en `LLMResult`.
 - **Clientes asíncronos** (`AsyncOpenAI` / `AsyncAnthropic`): una llamada al LLM tarda segundos y
   no debe bloquear el event loop de FastAPI.
+- **Streaming con el mismo contrato.** `stream_estimation` comparte con `generate_estimation` el
+  prompt, la traducción de errores y las métricas; solo cambia cómo se consume el SDK
+  (Responses API con `stream=True` / `messages.stream()` de Anthropic).
 
 ## Latencia, coste, calidad y seguridad
 
@@ -81,6 +98,53 @@ Estructura de mensajes enviada al modelo:
 - **Errores del proveedor:** timeout → `504`, rate limit → `503`, otros errores → `502`, sin
   exponer detalles internos.
 
+## Interfaz de chat (Streamlit)
+
+```bash
+make dev   # API (puerto 8000) + interfaz (http://localhost:8501) a la vez; Ctrl+C para las dos
+```
+
+O por separado, en dos terminales: `make run` y `make ui` (equivale a `streamlit run streamlit_app.py`).
+
+![Interfaz de chat del estimador](docs/streamlit_ui.png)
+
+| Nivel del ejercicio | Cómo está resuelto |
+| --- | --- |
+| 1. Chat básico | `st.chat_message` + `st.chat_input` (se puede pegar texto o adjuntar un `.txt`/`.md`). El historial vive en `st.session_state`; el system prompt es el del endpoint CAG porque lo construye el backend. Botón para probar con la transcripción de ejemplo y otro para empezar una conversación nueva. |
+| 2. Streaming | `st.write_stream` consume los eventos SSE de `POST /api/v1/estimate/stream`: la estimación se ve escribiéndose en Markdown, token a token. |
+| 3. Contexto CAG | `st.sidebar` con el system prompt activo (bloque de solo lectura), las tarifas y las estimaciones de referencia tal como se inyectan, y las métricas de la última llamada: modelo, tokens de entrada/salida (y cacheados), tiempo total, tiempo hasta el primer token y coste aproximado. |
+
+Decisiones de diseño:
+
+- **Streamlit es un cliente HTTP, no un segundo backend.** No importa `llm_service` ni los SDK
+  de los proveedores, y no necesita API keys (solo `ESTIMADOR_API_URL`, por defecto
+  `http://localhost:8000`). La lógica de IA vive en un único sitio y el frontend se puede
+  cambiar por otro (React, una app móvil…) sin tocar el servicio.
+- **Server-Sent Events** en lugar de texto plano: cada evento lleva un tipo y un JSON, así que
+  por el mismo stream viajan el texto y los metadatos finales.
+
+  ```
+  event: delta
+  data: {"text": "## Estimación"}
+
+  event: done
+  data: {"model": "gpt-4o-mini", "usage": {...}, "latency_ms": 6309, "truncated": false, ...}
+  ```
+
+  Si el proveedor falla a mitad de la respuesta, llega `event: error` con
+  `{"detail", "status_code"}`.
+- **Errores tempranos con su código HTTP.** El endpoint espera al primer fragmento del modelo
+  antes de responder. Si el proveedor falla de entrada (API key, rate limit, timeout), el
+  cliente recibe 502/503/504 igual que con `POST /estimate`, y no un `200` con un error dentro.
+  Por eso no se usa `EventSourceResponse` como `response_class` (obliga a que el endpoint sea un
+  generador) sino un `StreamingResponse` con `text/event-stream`.
+- **Cierre del stream.** Si el usuario abandona la respuesta (recarga la página, pulsa *Nueva
+  conversación*), los generadores se cierran en cadena (`aclosing`) y se corta también la
+  conexión con el proveedor: no se siguen pagando tokens que nadie va a leer.
+- **Cada mensaje se estima por separado** (single-turn, igual que el endpoint): el historial se
+  ve en pantalla, pero no se reenvía al modelo. Una estimación a medias (stream cortado) se queda
+  en pantalla, pero no entra en el historial.
+
 ## Puesta en marcha
 
 Requisitos: [uv](https://docs.astral.sh/uv/getting-started/installation/) y una API key de OpenAI
@@ -100,6 +164,8 @@ Otro puerto: `make run PORT=9000`.
 | Comando | Qué hace |
 | --- | --- |
 | `make run` | Arranca el servidor con recarga automática (target por defecto) |
+| `make ui` | Interfaz de chat Streamlit (con la API en marcha) |
+| `make dev` | API + interfaz a la vez |
 | `make test` | Tests con el LLM simulado (sin coste) |
 | `make lint` | Lint y formato con ruff |
 | `make format` | Formatea el código y aplica arreglos automáticos |
@@ -120,7 +186,6 @@ Respuesta (resumida):
 
 ```json
 {
-  "estimation": "## Estimación: ...\n\n### Resumen del proyecto\n...",
   "model": "gpt-4o-mini",
   "provider": "openai",
   "usage": {"input_tokens": 2350, "output_tokens": 780, "cached_input_tokens": 0},
@@ -128,8 +193,17 @@ Respuesta (resumida):
   "latency_ms": 9120,
   "finish_reason": "completed",
   "truncated": false,
-  "created_at": "2026-10-06T10:00:00Z"
+  "created_at": "2026-10-06T10:00:00Z",
+  "estimation": "## Estimación: ...\n\n### Resumen del proyecto\n..."
 }
+```
+
+En streaming (`-N` para que curl no acumule la salida):
+
+```bash
+curl -N -X POST http://localhost:8000/api/v1/estimate/stream \
+  -H "Content-Type: application/json" \
+  -d '{"transcription": "En la reunión con el equipo de marketing, el cliente explicó que necesita una landing page con formulario de contacto e integración con HubSpot."}'
 ```
 
 ### Transcripción de prueba
@@ -156,11 +230,17 @@ make lint   # lint y formato
   bien y el orden del prompt es instrucciones → referencias → reglas.
 - `tests/test_api.py`: `/health`, `/docs`, `POST /api/v1/estimate` (con el proveedor simulado),
   validación de entrada (422) y traducción de errores del proveedor (503).
+- `tests/test_streaming.py`: eventos SSE `delta` → `done`, error antes del primer token como
+  HTTP 503, error a mitad del stream como evento `error`, respuesta vacía, `/context`, y cómo se
+  normalizan los eventos de streaming de OpenAI (completo, truncado, fallido) y de Anthropic.
+- `tests/test_streamlit_app.py`: el cliente SSE contra la API real (con el LLM simulado) y la app
+  completa con `streamlit.testing` (`AppTest`): contexto en el sidebar, dos estimaciones seguidas
+  que quedan en el historial, métricas, botón de ejemplo y API caída.
 
 El pipeline [`.github/workflows/estimador-cag-ci.yml`](../.github/workflows/estimador-cag-ci.yml)
 se ejecuta en cada push: comprueba que no haya `.env` versionado, instala con `uv sync --locked`,
-pasa ruff y pytest y arranca el servidor para probar `/health`, `/docs` y el OpenAPI. Lanzado a
-mano (`workflow_dispatch`) y con el secreto `OPENAI_API_KEY` configurado, también ejecuta la
+pasa ruff y pytest y arranca la API y la interfaz Streamlit para probar `/health`, `/docs`, el
+OpenAPI, `/api/v1/context` y el health check de Streamlit. Lanzado a mano (`workflow_dispatch`) y con el secreto `OPENAI_API_KEY` configurado, también ejecuta la
 prueba end-to-end con el LLM real.
 
 ## Variables de entorno
@@ -176,10 +256,16 @@ prueba end-to-end con el LLM real.
 | `LLM_TIMEOUT_SECONDS` | Timeout de la llamada al LLM | `60` |
 | `APP_ENV` | Entorno de ejecución | `development` |
 | `LOG_LEVEL` | Nivel de logging | `DEBUG` |
+| `ESTIMADOR_API_URL` | URL de la API que usa la interfaz Streamlit (no va en `.env`: es del cliente) | `http://localhost:8000` |
 
 ## Limitaciones
 
-- Single-turn: no se puede refinar una estimación en varios turnos (no hay historial).
+- Single-turn: no se puede refinar una estimación en varios turnos. La interfaz muestra el
+  historial, pero cada mensaje se estima por separado.
+- `GET /api/v1/context` expone el system prompt. Aquí no es secreto (el repo es público), pero en
+  producción habría que protegerlo o desactivarlo.
+- La interfaz es para demos y pruebas internas: sin autenticación ni persistencia de
+  conversaciones (se pierden al recargar la página).
 - Los ejemplos de referencia son ficticios y estáticos. La calidad depende de lo representativos
   que sean.
 - La aritmética la hace el modelo: los totales de la estimación generada pueden tener errores
