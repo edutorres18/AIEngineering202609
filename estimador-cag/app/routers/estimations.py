@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import aclosing
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from fastapi.sse import format_sse_event
 
@@ -20,6 +20,7 @@ from app.schemas.estimation import (
 )
 from app.services import llm_service
 from app.services.llm_service import LLMServiceError
+from app.sessions.store import SessionStore, get_session_store
 
 router = APIRouter(tags=["estimations"])
 
@@ -109,11 +110,16 @@ async def estimate_stream(request: EstimationRequest) -> SSEResponse:
     response_model=CAGContext,
     summary="Contexto CAG que recibe el modelo: system prompt, tarifas y referencias",
     description="El system prompt depende de los parámetros del formulario: se pueden indicar "
-    "aquí para ver el que recibe el modelo con cada combinación.",
+    "aquí para ver el que recibe el modelo con cada combinación. Con `session_id`, es el system "
+    "prompt v2 que recibirá el próximo turno de esa conversación, con su ficha del proyecto.",
+    responses={404: {"description": "La sesión no existe"}},
 )
 async def context(
+    store: Annotated[SessionStore, Depends(get_session_store)],
     project_type: Annotated[ProjectType, Query()] = ProjectType.WEB_SAAS,
     detail_level: Annotated[DetailLevel, Query()] = DetailLevel.MEDIUM,
     output_format: Annotated[OutputFormat, Query()] = OutputFormat.PHASES_TABLE,
+    session_id: Annotated[str | None, Query(description="Sesión de conversación")] = None,
 ) -> CAGContext:
-    return llm_service.get_cag_context(project_type, detail_level, output_format)
+    metadata = store.get(session_id).metadata if session_id else None
+    return llm_service.get_cag_context(project_type, detail_level, output_format, metadata=metadata)

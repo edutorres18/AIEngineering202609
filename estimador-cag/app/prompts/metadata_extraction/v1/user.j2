@@ -1,0 +1,20 @@
+<previous_metadata>
+{% if previous.is_empty() %}
+(vacía: es el primer turno)
+{% else %}
+- project_name: {{ previous.project_name or "null" }}
+- assumed_team_size: {{ previous.assumed_team_size or "null" }}
+- mentioned_technologies: {{ previous.mentioned_technologies | join(", ") if previous.mentioned_technologies else "ninguna" }}
+- agreed_scope: {{ previous.agreed_scope or "null" }}
+{% endif %}
+</previous_metadata>
+
+<latest_client_message>
+{{ transcript }}
+</latest_client_message>
+
+<latest_estimation>
+{{ estimation }}
+</latest_estimation>
+
+Extrae la ficha del proyecto de este turno.

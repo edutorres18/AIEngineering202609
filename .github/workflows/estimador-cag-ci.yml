@@ -66,6 +66,11 @@ jobs:
           # Las plantillas Jinja2 se cargan desde disco: un prompt renderizado con parámetros
           curl -sf 'http://localhost:8000/api/v1/context?output_format=narrative&detail_level=detailed' \
             | grep -q 'sin tablas ni listas'
+          # Sesión 5: se crea una conversación y su contexto lleva el prompt v2 con la ficha
+          SESSION_ID=$(curl -sf -X POST http://localhost:8000/sessions | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
+          curl -sf "http://localhost:8000/sessions/$SESSION_ID" | grep -q '"max_turns":6'
+          curl -sf "http://localhost:8000/api/v1/context?session_id=$SESSION_ID" | grep -q 'project_metadata'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/sessions/no-existe)" = 404
           curl -sf http://localhost:8501/_stcore/health
 
   live:

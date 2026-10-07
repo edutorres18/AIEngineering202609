@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     LLM_MAX_OUTPUT_TOKENS: int = 3000
     LLM_TEMPERATURE: float | None = 0.2  # solo OpenAI; None para modelos que no lo admiten
     LLM_TIMEOUT_SECONDS: float = 60.0
+    # Conversación (sesión 5): pares user+assistant que conserva la ventana deslizante.
+    MAX_CONVERSATION_TURNS: int = Field(default=6, ge=1)
+    # Tope de caracteres por adjunto extraído: protege el prompt (el chunking llega con RAG).
+    MAX_ATTACHMENT_CHARS: int = Field(default=60_000, ge=1)
+    # Modelo de la segunda llamada que extrae la ficha del proyecto; vacío → el de LLM_MODEL.
+    METADATA_EXTRACTOR_MODEL: str = ""
     APP_ENV: Literal["development", "test", "staging", "production"] = "development"
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "DEBUG"
 
@@ -44,6 +50,8 @@ class Settings(BaseSettings):
             )
         if not self.LLM_MODEL:
             self.LLM_MODEL = DEFAULT_MODELS[self.LLM_PROVIDER]
+        if not self.METADATA_EXTRACTOR_MODEL:
+            self.METADATA_EXTRACTOR_MODEL = self.LLM_MODEL
         return self
 
 

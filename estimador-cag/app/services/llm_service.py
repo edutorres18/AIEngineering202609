@@ -8,6 +8,10 @@ Estructura de mensajes (CAG, single-turn):
 El prompt sale de las plantillas Jinja2 versionadas de app/prompts (ver loader.py).
 La estimación se puede pedir completa (generate_estimation) o en streaming
 (stream_estimation); ambas usan el mismo prompt, los mismos errores y las mismas métricas.
+
+En una conversación (sesión 5, ver conversation_service.py) el array lleva además los turnos
+anteriores entre el system y el mensaje nuevo; complete() acepta cualquier array de mensajes.
+extract_structured() pide al modelo un objeto Pydantic (salida estructurada del proveedor).
 """
 
 import logging
@@ -17,13 +21,20 @@ from contextlib import aclosing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
+from typing import TypeVar
 
 import anthropic
 import openai
+from pydantic import BaseModel
 
 from app.config import Settings, get_settings
 from app.context.examples import HOURLY_RATES_EUR, reference_estimations
-from app.prompts.loader import PROMPT_VERSION, render_estimation_prompt, render_system_prompt
+from app.prompts.loader import (
+    CONVERSATION_PROMPT_VERSION,
+    PROMPT_VERSION,
+    render_estimation_prompt,
+    render_system_prompt,
+)
 from app.schemas.estimation import (
     CAGContext,
     DetailLevel,
@@ -34,8 +45,11 @@ from app.schemas.estimation import (
     ProjectType,
     TokenUsage,
 )
+from app.sessions.models import ProjectMetadata
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T", bound=BaseModel)
 
 # Precios aproximados en USD por millón de tokens (entrada, salida). Revisar periódicamente.
 MODEL_PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
@@ -70,14 +84,21 @@ def get_cag_context(
     detail_level: DetailLevel,
     output_format: OutputFormat,
     settings: Settings | None = None,
+    metadata: ProjectMetadata | None = None,
 ) -> CAGContext:
-    """Contexto que recibe el modelo con estos parámetros, para mostrarlo en la interfaz."""
+    """Contexto que recibe el modelo con estos parámetros, para mostrarlo en la interfaz.
+
+    Con `metadata` (la ficha de una sesión), el system prompt es el v2 de la conversación.
+    """
     settings = settings or get_settings()
+    version = PROMPT_VERSION if metadata is None else CONVERSATION_PROMPT_VERSION
     return CAGContext(
         provider=settings.LLM_PROVIDER,
         model=settings.LLM_MODEL,
-        prompt_version=PROMPT_VERSION,
-        system_prompt=render_system_prompt(project_type, detail_level, output_format),
+        prompt_version=version,
+        system_prompt=render_system_prompt(
+            project_type, detail_level, output_format, version, metadata
+        ),
         hourly_rates_eur=HOURLY_RATES_EUR,
         examples=list(reference_estimations()),
     )
@@ -145,6 +166,16 @@ async def _call_openai(settings: Settings, messages: list[dict[str, str]]) -> LL
     return _openai_result(response)
 
 
+async def _parse_openai(
+    settings: Settings, messages: list[dict[str, str]], response_model: type[T]
+) -> tuple[T | None, LLMResult]:
+    """Salida estructurada: OpenAI restringe la respuesta al JSON Schema del modelo Pydantic."""
+    response = await _openai_client().responses.parse(
+        **_openai_request(settings, messages), text_format=response_model
+    )
+    return response.output_parsed, _openai_result(response)
+
+
 async def _stream_openai(
     settings: Settings, messages: list[dict[str, str]]
 ) -> AsyncIterator[str | LLMResult]:
@@ -195,6 +226,16 @@ async def _call_anthropic(settings: Settings, messages: list[dict[str, str]]) ->
     return _anthropic_result(response)
 
 
+async def _parse_anthropic(
+    settings: Settings, messages: list[dict[str, str]], response_model: type[T]
+) -> tuple[T | None, LLMResult]:
+    """Salida estructurada: Anthropic restringe la respuesta al JSON Schema del modelo Pydantic."""
+    message = await _anthropic_client().messages.parse(
+        **_anthropic_request(settings, messages), output_format=response_model
+    )
+    return message.parsed_output, _anthropic_result(message)
+
+
 async def _stream_anthropic(
     settings: Settings, messages: list[dict[str, str]]
 ) -> AsyncIterator[str | LLMResult]:
@@ -238,17 +279,23 @@ def _provider_errors(provider: str) -> Iterator[None]:
 
 def _log_request(settings: Settings, messages: list[dict[str, str]], *, streaming: bool) -> None:
     logger.debug(
-        "Llamando a %s/%s (system=%d chars, user=%d chars, streaming=%s)",
+        "Llamando a %s/%s (%d mensajes, system=%d chars, último user=%d chars, streaming=%s)",
         settings.LLM_PROVIDER,
         settings.LLM_MODEL,
+        len(messages),
         len(messages[0]["content"]),
-        len(messages[1]["content"]),
+        len(messages[-1]["content"]),
         streaming,
     )
 
 
 def _build_metadata(
-    settings: Settings, result: LLMResult, start: float, *, streaming: bool
+    settings: Settings,
+    result: LLMResult,
+    start: float,
+    *,
+    streaming: bool,
+    prompt_version: str = PROMPT_VERSION,
 ) -> EstimationMetadata:
     """Valida el resultado, registra las métricas de la llamada y las devuelve."""
     latency_ms = int((time.perf_counter() - start) * 1000)
@@ -260,8 +307,9 @@ def _build_metadata(
             settings.LLM_MAX_OUTPUT_TOKENS,
         )
     logger.info(
-        "Estimación generada provider=%s model=%s streaming=%s input_tokens=%d "
+        "Estimación generada prompt=%s provider=%s model=%s streaming=%s input_tokens=%d "
         "output_tokens=%d cached_tokens=%d latency_ms=%d finish_reason=%s",
+        prompt_version,
         settings.LLM_PROVIDER,
         settings.LLM_MODEL,
         streaming,
@@ -272,7 +320,7 @@ def _build_metadata(
         result.finish_reason,
     )
     return EstimationMetadata(
-        prompt_version=PROMPT_VERSION,
+        prompt_version=prompt_version,
         model=settings.LLM_MODEL,
         provider=settings.LLM_PROVIDER,
         usage=TokenUsage(
@@ -290,19 +338,65 @@ def _build_metadata(
     )
 
 
-async def generate_estimation(
-    request: EstimationRequest, settings: Settings | None = None
+async def complete(
+    messages: list[dict[str, str]],
+    *,
+    prompt_version: str = PROMPT_VERSION,
+    settings: Settings | None = None,
 ) -> EstimationResponse:
+    """Llama al proveedor con un array de mensajes ya montado (system primero)."""
     settings = settings or get_settings()
-    messages = build_messages(request)
     call = _call_openai if settings.LLM_PROVIDER == "openai" else _call_anthropic
     _log_request(settings, messages, streaming=False)
 
     start = time.perf_counter()
     with _provider_errors(settings.LLM_PROVIDER):
         result = await call(settings, messages)
-    metadata = _build_metadata(settings, result, start, streaming=False)
+    metadata = _build_metadata(
+        settings, result, start, streaming=False, prompt_version=prompt_version
+    )
     return EstimationResponse(**metadata.model_dump(), text=result.text)
+
+
+async def generate_estimation(
+    request: EstimationRequest, settings: Settings | None = None
+) -> EstimationResponse:
+    return await complete(build_messages(request), settings=settings)
+
+
+async def extract_structured(
+    messages: list[dict[str, str]],
+    response_model: type[T],
+    *,
+    model: str,
+    max_output_tokens: int = 1000,
+    settings: Settings | None = None,
+) -> T:
+    """Pide al modelo un objeto `response_model` validado (salida estructurada del proveedor).
+
+    Se usa para llamadas auxiliares y baratas, como el extractor de la ficha del proyecto: por
+    eso admite otro modelo y otro límite de tokens que los de la estimación.
+    """
+    settings = (settings or get_settings()).model_copy(
+        update={"LLM_MODEL": model, "LLM_MAX_OUTPUT_TOKENS": max_output_tokens}
+    )
+    parse = _parse_openai if settings.LLM_PROVIDER == "openai" else _parse_anthropic
+    _log_request(settings, messages, streaming=False)
+
+    start = time.perf_counter()
+    with _provider_errors(settings.LLM_PROVIDER):
+        parsed, result = await parse(settings, messages, response_model)
+    if parsed is None:  # el modelo se negó o la respuesta se cortó antes de cerrar el JSON
+        raise LLMServiceError("El proveedor LLM no devolvió una respuesta estructurada válida")
+    logger.info(
+        "Salida estructurada %s model=%s input_tokens=%d output_tokens=%d latency_ms=%d",
+        response_model.__name__,
+        settings.LLM_MODEL,
+        result.input_tokens,
+        result.output_tokens,
+        int((time.perf_counter() - start) * 1000),
+    )
+    return parsed
 
 
 async def stream_estimation(

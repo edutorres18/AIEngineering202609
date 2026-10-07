@@ -25,6 +25,20 @@ REQUIRED_PATHS = [
     "app/prompts/estimation/v1/user.j2",
     "app/prompts/estimation/v1/examples.j2",
     "tests/prompts/test_estimation_v1.py",
+    # Sesión 5: conversación con memoria y adjuntos
+    "app/routers/sessions.py",
+    "app/schemas/session.py",
+    "app/services/conversation_service.py",
+    "app/sessions/__init__.py",
+    "app/sessions/models.py",
+    "app/sessions/store.py",
+    "app/sessions/metadata_extractor.py",
+    "app/attachments/__init__.py",
+    "app/attachments/extractor.py",
+    "app/prompts/estimation/v2/system.j2",
+    "app/prompts/estimation/v2/user.j2",
+    "app/prompts/metadata_extraction/v1/system.j2",
+    "app/prompts/metadata_extraction/v1/user.j2",
     "streamlit_app.py",
     ".env.example",
     ".gitignore",
@@ -39,6 +53,9 @@ REQUIRED_ENV_VARS = [
     "LLM_MODEL",
     "APP_ENV",
     "LOG_LEVEL",
+    "MAX_CONVERSATION_TURNS",
+    "MAX_ATTACHMENT_CHARS",
+    "METADATA_EXTRACTOR_MODEL",
 ]
 
 

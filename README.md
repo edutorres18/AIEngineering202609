@@ -6,7 +6,7 @@ clientes y genera presupuestos basados en el histórico de la empresa.
 
 | Fase | Arquitectura | Estado |
 | --- | --- | --- |
-| Módulo 2 · Sesión 2 | CAG: contexto estático inyectado en el prompt | ✅ [`estimador-cag/`](estimador-cag/) |
+| Módulo 2 · Sesiones 2-5 | CAG: contexto estático inyectado en el prompt; desde la sesión 5, conversación con memoria y adjuntos | ✅ [`estimador-cag/`](estimador-cag/) |
 | Módulos 3-4 | RAG con búsqueda semántica | Pendiente |
 | Módulo 5 | Orquestación de agentes | Pendiente |
 | Módulo 6 | Producción | Pendiente |

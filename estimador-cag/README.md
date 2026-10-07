@@ -5,16 +5,155 @@ una reunión con el cliente) y tres parámetros: **tipo de proyecto, nivel de de
 Devuelve una **estimación** (desglose, horas, costes, equipo, duración y riesgos) generada por un
 LLM.
 
+Desde la sesión 5 la estimación es una **conversación**: el cliente puede precisar el alcance
+en varios turnos y adjuntar documentos PDF o Word, y el estimador recuerda el proyecto en curso.
+
 Es el Proyecto 1 del programa AI Engineering 2026/09 (LIDR), en su primera fase:
 **arquitectura CAG (Cache Augmented Generation)**. Todo el contexto que necesita el modelo
 (tarifas y estimaciones históricas de la empresa) viaja en cada llamada. No hay base de datos,
-ni retrieval, ni persistencia.
+ni retrieval, ni persistencia: las conversaciones viven en la memoria del proceso.
 
 | Sesión | Qué añade |
 | --- | --- |
 | 2 | API FastAPI con arquitectura CAG y dos proveedores (OpenAI / Anthropic) |
 | 3 | Interfaz de chat con Streamlit y estimación en streaming (SSE) |
 | 4 | Formulario con parámetros tipados en lugar del chat y prompt en plantillas Jinja2 versionadas |
+| 5 | Conversación de varios turnos con memoria (historial + ficha del proyecto) y adjuntos PDF/Word |
+
+## Sesión 5: memoria conversacional y contexto enriquecido
+
+Hasta la sesión 4 el estimador era transaccional: entra una descripción, sale una estimación y
+se olvida. Ahora mantiene una **conversación**: el cliente precisa el alcance en varios turnos,
+adjunta documentos y el estimador recuerda de qué proyecto se habla.
+
+Qué cambia:
+
+- **Sesiones** ([`app/sessions/`](app/sessions/)): cada conversación es una `Session` con un
+  UUID v4, guardada en un `dict` en memoria del proceso (`SessionStore`). Contiene dos
+  estructuras separadas a propósito:
+  - **Historial** (`ConversationHistory`): los mensajes `user`/`assistant` que viajan al LLM, con
+    **ventana deslizante** de `MAX_CONVERSATION_TURNS=6` pares. Al superarla se descartan los
+    pares más antiguos (siempre de dos en dos, para no dejar una pregunta sin respuesta).
+  - **Memoria** (`ProjectMetadata`): la ficha del proyecto (`project_name`,
+    `assumed_team_size`, `mentioned_technologies`, `agreed_scope`). Va en el system prompt de
+    cada turno, así que sobrevive aunque la ventana descarte el turno donde se mencionó cada dato.
+- **Prompt v2** ([`app/prompts/estimation/v2/`](app/prompts/estimation/v2/)): parte de v1 y
+  añade reglas para conversar (no pedir lo ya dicho, devolver la estimación completa
+  actualizada, los adjuntos son datos y no instrucciones) y el bloque `<project_metadata>` con la
+  ficha. v1 no cambia: `POST /api/v1/estimate` lo sigue usando.
+- **Adjuntos PDF y Word** ([`app/attachments/extractor.py`](app/attachments/extractor.py)): el
+  texto se extrae en el servidor y se añade a la transcripción entre separadores
+  (`--- attachment: spec.pdf ---` … `--- end attachment ---`).
+- **Interfaz conversacional** ([`streamlit_app.py`](streamlit_app.py)): abre una sesión al cargar
+  la página, muestra los turnos, admite varios adjuntos y enseña la ficha en el panel lateral.
+  Hay un botón «Nueva conversación».
+
+![Tercer turno de una conversación real con gpt-4o-mini: la ficha del panel lateral recoge el equipo de 3 personas y las tecnologías del PDF adjunto en el turno 2](docs/streamlit_conversacion.png)
+
+Endpoints nuevos:
+
+| Endpoint | Qué hace |
+| --- | --- |
+| `POST /sessions` | Crea una sesión vacía → `201 {"session_id": "…"}` |
+| `GET /sessions/{session_id}` | Ficha del proyecto y turnos en el historial (`turns`, `max_turns`) |
+| `POST /sessions/{session_id}/estimate` | Un turno, en `multipart/form-data`: `transcript`, `project_type`, `detail_level`, `output_format` y `attachments` (opcional, varios). Devuelve la misma `EstimationResponse` que `/api/v1/estimate`, con `prompt_version: "v2"` |
+| `GET /api/v1/context?session_id=…` | El system prompt v2 que recibirá el próximo turno de esa sesión, con su ficha |
+
+```bash
+curl -X POST http://localhost:8000/sessions
+# {"session_id":"0f05f4aa-…"}
+curl -X POST http://localhost:8000/sessions/0f05f4aa-…/estimate \
+  -F transcript="El cliente confirmó pagos con Stripe y un equipo de 3 personas." \
+  -F project_type=web_saas -F detail_level=medium -F output_format=phases_table \
+  -F attachments=@especificacion.pdf
+curl http://localhost:8000/sessions/0f05f4aa-…
+```
+
+Cada turno, en [`app/services/conversation_service.py`](app/services/conversation_service.py):
+
+```
+1. render del prompt v2 con la ficha actual
+2. messages = [system v2] + últimos ≤6 pares (user, assistant) + [user nuevo]
+3. llamada al LLM (mismo wrapper, errores y métricas que la estimación de un solo turno)
+4. el turno se guarda en el historial (la ventana recorta)
+5. segunda llamada: el extractor actualiza la ficha
+```
+
+Si el paso 3 falla, la sesión no cambia y el turno se puede reintentar. Si falla el paso 5, la
+estimación se devuelve igual y la ficha se queda como estaba.
+
+### Decisiones
+
+- **Adjuntos por el camino B (extracción local con `pypdf` y `python-docx`).** El camino A
+  (subir el binario a la Files API del proveedor) es menos código e interpreta diagramas, pero
+  ata el servicio a un proveedor multimodal. Con el B, al LLM le llega solo texto: funciona igual
+  con OpenAI y con Anthropic, se controla qué entra en el prompt y prepara el terreno para el
+  chunking de RAG del módulo 3. Lo que se pierde es lo visual (diagramas, imágenes; un PDF
+  escaneado no tiene texto que extraer). Del Word se leen párrafos **y tablas**. Cada adjunto se
+  recorta a `MAX_ATTACHMENT_CHARS=60000` caracteres. Un formato que no sea `.pdf` o `.docx`
+  devuelve `415`, y un archivo dañado, `422`, sin llamar al LLM.
+- **La ficha se extrae con un LLM, no con una heurística.** Tras cada respuesta, una segunda
+  llamada (prompt [`metadata_extraction/v1`](app/prompts/metadata_extraction/v1/)) lee la ficha
+  anterior, el mensaje del cliente y la estimación, y devuelve un `ProjectMetadata`. La
+  estimación es Markdown libre y el cliente escribe como quiere: unas regex se romperían con
+  cualquier paráfrasis. La llamada es corta y usa un modelo barato (`METADATA_EXTRACTOR_MODEL`):
+  en las pruebas reales, unos 2.200 tokens de entrada por turno con `gpt-4o-mini` (~0,0004 USD).
+- **Salida estructurada nativa de cada SDK, sin Instructor.** `responses.parse(text_format=…)` en
+  OpenAI y `messages.parse(output_format=…)` en Anthropic devuelven el objeto Pydantic ya
+  validado ([`llm_service.extract_structured`](app/services/llm_service.py)). Si el modelo no
+  devuelve un objeto válido, se registra y se conserva la ficha anterior.
+- **Fusión de la ficha:** un dato nuevo sustituye al anterior y `null` no borra nada; las
+  tecnologías se acumulan sin repetirse (sin distinguir mayúsculas). Por eso el extractor tiene
+  la regla «ante la duda, null»: un dato inventado sustituiría a uno correcto.
+- **La ficha va al final del system prompt.** Es lo único que cambia entre turnos: tarifas,
+  ejemplos, reglas y parámetros siguen formando un prefijo idéntico que el proveedor puede
+  cachear (hay un test que lo comprueba).
+- **Memoria en el proceso, sin BBDD ni Redis.** Se pierde al reiniciar el servidor (también
+  cuando `make run` recarga el código) y no sirve con varios workers. Para esta fase es
+  aceptable y está documentado en [`store.py`](app/sessions/store.py). Una sesión desconocida
+  devuelve `404`, y la interfaz lo detecta y abre una conversación nueva avisando.
+- **El historial guarda el mensaje completo, adjuntos incluidos**, como la solución de
+  referencia. El modelo los sigue viendo mientras el turno está en la ventana, a costa de
+  reenviar ese texto en cada llamada (el contexto dinámico tiene coste por petición).
+
+En qué se aparta de la solución de referencia, y por qué:
+
+- **Interfaz en Streamlit**, no en Rails: es el cliente que elegimos en la sesión 3. El patrón es
+  el mismo: crea la sesión, guarda el `session_id`, envía los turnos y muestra la ficha.
+- **Sin Instructor ni LiteLLM** (todavía no están en el proyecto): la salida estructurada usa los
+  SDK oficiales y el wrapper propio de dos proveedores.
+- **`METADATA_EXTRACTOR_MODEL` vacío usa el modelo de `LLM_MODEL`** (`gpt-4o-mini` o
+  `claude-haiku-4-5`), para que funcione con los dos proveedores.
+- **Nombre del proyecto:** si el cliente no le ha puesto nombre, el extractor guarda el título
+  que usó la primera estimación. Así el nombre no cambia entre turnos (uno de los criterios del
+  ejercicio).
+- **`GET /api/v1/context?session_id=…`** enseña el system prompt v2 con la ficha. La interfaz lo
+  muestra en el panel lateral, para ver cómo la memoria entra en el prompt.
+- **El formulario conserva los parámetros tipados** de la sesión 4 (tipo, formato y nivel), además
+  de `transcript` y `attachments`, igual que la solución de referencia.
+
+Cómo levantar y testear:
+
+```bash
+cd estimador-cag
+make dev     # API (:8000) + interfaz conversacional en http://localhost:8501
+make test    # toda la suite, con el LLM simulado (sin coste)
+uv run pytest tests/test_sessions.py   # los tests de integración de la conversación
+```
+
+Los tres tests que pide el ejercicio están en
+[`tests/test_sessions.py`](tests/test_sessions.py) y usan `TestClient` con el proveedor
+simulado (`FakeLLM` en `conftest.py`), que guarda cada array de mensajes enviado:
+
+- **dos turnos enlazados actualizan la ficha:** el primero arranca sin ficha, el segundo la
+  recibe en el system prompt junto con el turno anterior, y `GET /sessions/{id}` la devuelve
+  fusionada;
+- **un PDF adjunto llega a la estimación:** el mensaje enviado al modelo con el adjunto contiene
+  exactamente su texto entre separadores, y sin el adjunto no (también lo recibe el extractor);
+- **8 turnos con una ventana de 3 nunca envían más de `1 + 3×2 + 1 = 8` mensajes** (tamaños 2,
+  4, 6, 8, 8, 8, 8, 8), y en el último el turno 1 ya no está en el historial pero el nombre del
+  proyecto sigue en la ficha.
+
 
 ## Sesión 4: del chat a la interfaz de producto
 
@@ -65,33 +204,41 @@ uv run pytest tests/prompts # solo los tests de plantilla (milisegundos)
 
 ```mermaid
 flowchart LR
-    U[streamlit_app.py<br/>formulario st.form] -->|POST /api/v1/estimate<br/>EstimationRequest| R
-    U -->|GET /api/v1/context| R
+    U[streamlit_app.py<br/>conversación + formulario] -->|POST /sessions<br/>POST /sessions/id/estimate multipart<br/>GET /sessions/id| RS[routers/sessions.py]
+    U -->|GET /api/v1/context?session_id| R
     C[Cliente<br/>curl / Swagger] -->|POST /api/v1/estimate<br/>o /estimate/stream SSE| R[routers/estimations.py<br/>valida con Pydantic]
+    RS --> A[attachments/extractor.py<br/>texto de PDF y Word]
+    RS --> CS[services/conversation_service.py<br/>un turno con memoria]
+    CS <--> M[(sessions/store.py<br/>historial + ficha<br/>en memoria)]
+    CS --> S
+    CS --> E[sessions/metadata_extractor.py<br/>actualiza la ficha]
+    E --> S
     R --> S[services/llm_service.py<br/>llama al proveedor]
-    S --> P[prompts/loader.py<br/>renderiza estimation/v1/*.j2]
+    S --> P[prompts/loader.py<br/>estimation v1 / v2<br/>metadata_extraction v1]
     X[context/examples.py<br/>tarifas + estimaciones históricas] --> P
-    S -->|system + user| L[(LLM<br/>OpenAI / Anthropic)]
-    L -->|completa o en streaming| S
-    S --> R
+    S -->|mensajes| L[(LLM<br/>OpenAI / Anthropic)]
+    L -->|texto, streaming u objeto estructurado| S
 ```
 
 | Capa | Archivo | Responsabilidad |
 | --- | --- | --- |
-| Entrada | `app/main.py` | Crea la app, registra el router con prefijo `/api/v1`, `/health`, traduce errores del LLM a HTTP |
+| Entrada | `app/main.py` | Crea la app, registra los routers (`/api/v1` y `/sessions`), `/health`, traduce errores del LLM, de sesión y de adjuntos a HTTP |
 | Configuración | `app/config.py` | `BaseSettings` que lee `.env` y valida al arrancar (si falta la API key del proveedor, no arranca) |
-| Transporte | `app/routers/estimations.py` | Endpoint fino: recibe, delega y devuelve |
-| Negocio | `app/services/llm_service.py` | Arma los mensajes con el loader, llama al proveedor y normaliza la respuesta |
-| Prompts | `app/prompts/loader.py` + `app/prompts/estimation/v1/*.j2` | Plantillas Jinja2 versionadas; el loader es el único punto donde Python las toca |
-| Contratos | `app/schemas/estimation.py` | Request/response con Pydantic (documentados en Swagger) |
+| Transporte | `app/routers/estimations.py`, `app/routers/sessions.py` | Endpoints finos: reciben, delegan y devuelven |
+| Negocio | `app/services/llm_service.py` | Arma los mensajes con el loader, llama al proveedor y normaliza la respuesta; salida estructurada |
+| Conversación | `app/services/conversation_service.py`, `app/sessions/` | Un turno con memoria: historial con ventana deslizante, ficha del proyecto y su extractor |
+| Adjuntos | `app/attachments/extractor.py` | Texto de PDF y Word (camino B), recortado y entre separadores |
+| Prompts | `app/prompts/loader.py` + `app/prompts/<caso>/<versión>/*.j2` | Plantillas Jinja2 versionadas (estimación v1 y v2, extractor v1); el loader es el único punto donde Python las toca |
+| Contratos | `app/schemas/estimation.py`, `app/schemas/session.py` | Request/response con Pydantic (documentados en Swagger) |
 | Contexto CAG | `app/context/examples.py` | Tarifas por perfil y 3 estimaciones históricas ficticias, con costes y totales precalculados |
-| Interfaz | `streamlit_app.py` | Formulario Streamlit: cliente HTTP de la API, sin lógica de IA |
+| Interfaz | `streamlit_app.py` | Conversación con formulario en Streamlit: cliente HTTP de la API, sin lógica de IA |
 
 | Endpoint | Qué hace |
 | --- | --- |
-| `POST /api/v1/estimate` | Estimación completa en JSON (`EstimationResponse`). Es la que usa el formulario |
+| `POST /api/v1/estimate` | Estimación de un solo turno en JSON (`EstimationResponse`), con el prompt v1 |
 | `POST /api/v1/estimate/stream` | La misma estimación en streaming con Server-Sent Events |
-| `GET /api/v1/context` | System prompt para unos parámetros (`?project_type=…&detail_level=…&output_format=…`), tarifas y referencias |
+| `GET /api/v1/context` | System prompt para unos parámetros (`?project_type=…&detail_level=…&output_format=…`), tarifas y referencias; con `&session_id=…`, el v2 con la ficha de esa sesión |
+| `POST /sessions`, `GET /sessions/{id}`, `POST /sessions/{id}/estimate` | Conversación de varios turnos (ver [Sesión 5](#sesión-5-memoria-conversacional-y-contexto-enriquecido)). Es la que usa la interfaz |
 | `GET /health` | Estado, entorno, proveedor y modelo activos |
 
 Estructura de mensajes enviada al modelo:
@@ -99,7 +246,10 @@ Estructura de mensajes enviada al modelo:
 ```
 [system]    → system.j2: rol + uso del contexto + tarifas + examples.j2 + reglas
               + tipo de proyecto + formato de salida + nivel de detalle (según el formulario)
-[user]      → user.j2: <project_description>…</project_description>
+              (+ en v2: <project_metadata> con la ficha del proyecto, al final)
+[user]      ┐ en v2, los turnos anteriores de la ventana deslizante
+[assistant] ┘
+[user]      → user.j2: <project_description>…</project_description> (+ adjuntos entre separadores)
 [assistant] → estimación en Markdown
 ```
 
@@ -202,7 +352,8 @@ O por separado, en dos terminales: `make run` y `make ui` (equivale a `streamlit
 
 | Campo | Widget | Valor que viaja a la API |
 | --- | --- | --- |
-| Descripción del proyecto | `st.text_area`, más `st.file_uploader` para adjuntar una transcripción `.txt`/`.md` | `description` |
+| Descripción del proyecto (o lo nuevo en los turnos siguientes) | `st.text_area`, más `st.file_uploader` para adjuntar una transcripción `.txt`/`.md` | `transcript` |
+| Documentación adjunta | `st.file_uploader` con varios `.pdf`/`.docx` | `attachments` (multipart) |
 | Tipo de proyecto | `st.selectbox` | `mobile_app`, `web_saas`, `internal_tool` o `data_pipeline` |
 | Formato de salida | `st.selectbox` | `phases_table`, `line_items` o `narrative` |
 | Nivel de detalle | `st.pills` | `summary`, `medium` o `detailed` |
@@ -222,12 +373,20 @@ Decisiones de diseño:
 - **`st.form`:** cambiar un widget no relanza el script; solo se envía al pulsar *Generar
   estimación*. El formulario conserva sus valores, así que se puede cambiar un parámetro y volver
   a generar. La última estimación se guarda en `st.session_state`.
-- **Sin streaming:** `POST /api/v1/estimate` con un `st.spinner` mientras el modelo responde
-  (unos 5-15 s con `gpt-4o-mini`).
+- **Conversación (sesión 5):** al cargar la página se crea una sesión (`POST /sessions`) y su
+  `session_id` se guarda en `st.session_state`. Cada envío es un turno
+  (`POST /sessions/{id}/estimate`, en multipart con los adjuntos). Los turnos se muestran con
+  `st.chat_message` y, tras cada uno, el cuadro de texto y los selectores de archivos se vacían.
+  «Nueva conversación» abre otra sesión. Si la API ya no conoce la sesión (`404`, p. ej. tras
+  reiniciarse), la interfaz abre una nueva y lo avisa.
+- **Sin streaming:** cada turno espera la respuesta completa con un `st.spinner` (unos 10 s con
+  `gpt-4o-mini`, contando la segunda llamada que actualiza la ficha).
 - **Panel lateral:**
+  - la memoria del proyecto: la ficha que devuelve `GET /sessions/{id}` y cuántos turnos hay en
+    el historial (de los 6 de la ventana);
   - la última llamada: modelo, tokens, tiempo, versión del prompt y coste;
-  - el contexto CAG: el system prompt que recibió el modelo con los parámetros enviados (lo pide
-    a `GET /api/v1/context`), las tarifas y las estimaciones de referencia.
+  - el contexto CAG: el system prompt v2 que recibirá el próximo turno, con la ficha al final (lo
+    pide a `GET /api/v1/context?session_id=…`), las tarifas y las estimaciones de referencia.
 
 ### Streaming (`POST /api/v1/estimate/stream`)
 
@@ -365,6 +524,23 @@ make lint                   # lint y formato
     - el prefijo estático es común a todas;
     - un `{{ … }}` en la descripción no se evalúa;
     - una versión que no existe da error.
+- Sesión 5:
+  - `tests/test_sessions.py`: la conversación por HTTP. Los tres tests del ejercicio (ver
+    [Sesión 5](#sesión-5-memoria-conversacional-y-contexto-enriquecido)) y además: adjuntos Word
+    y varios a la vez, `404` de sesión desconocida, `415`/`422` de adjuntos sin llamar al LLM,
+    `422` del formulario, un fallo del LLM no toca la sesión, un fallo del extractor conserva la
+    ficha, el extractor usa su modelo y `/context?session_id=…` enseña el prompt v2.
+  - `tests/test_session_models.py`: ventana deslizante (descarta pares y conserva los más
+    recientes), orden de `to_messages_list()`, fusión de la ficha y almacén.
+  - `tests/test_attachments.py`: texto de un PDF y de un Word con tabla (generados en memoria en
+    [`tests/documents.py`](tests/documents.py)), recorte, formatos no admitidos y archivos dañados.
+  - `tests/prompts/test_estimation_v2.py`: la ficha en `<project_metadata>` (vacía o con datos),
+    el bloque al final con el prefijo cacheable, las reglas de v1 y las nuevas, v1 sin cambios y
+    el prompt del extractor.
+  - `tests/test_metadata_extractor.py`: la salida estructurada que se pide a cada SDK
+    (`text_format` / `output_format`), el error si no hay objeto y la fusión o conservación de la
+    ficha.
+  - `conftest.py` impide cualquier llamada real a un proveedor: un test que no lo simule falla.
 - `tests/test_context.py`: costes y totales de las referencias precalculados, mensajes `system` +
   `user` renderizados desde las plantillas, la descripción sin espacios sobrantes.
 - `tests/test_structure.py`: la estructura de carpetas es la de los ejercicios (incluidas las
@@ -388,7 +564,9 @@ make lint                   # lint y formato
   - el cliente HTTP contra la API real, con el LLM simulado;
   - la app completa con `streamlit.testing` (`AppTest`): el formulario con sus valores por
     defecto, el envío con otros parámetros (que llegan al prompt y al panel lateral), la
-    validación local sin llamar a la API, la API caída y la transcripción de ejemplo.
+    validación local sin llamar a la API, la API caída y la transcripción de ejemplo;
+  - desde la sesión 5: una conversación de tres turnos con la ficha en el panel, «Nueva
+    conversación» y la recuperación cuando la API ha perdido la sesión.
 
 El pipeline [`.github/workflows/estimador-cag-ci.yml`](../.github/workflows/estimador-cag-ci.yml)
 se ejecuta en cada push:
@@ -415,18 +593,25 @@ ejecuta la prueba end-to-end con el LLM real.
 | `LLM_TIMEOUT_SECONDS` | Timeout de la llamada al LLM | `60` |
 | `APP_ENV` | Entorno de ejecución | `development` |
 | `LOG_LEVEL` | Nivel de logging | `DEBUG` |
+| `MAX_CONVERSATION_TURNS` | Pares pregunta/respuesta que conserva la ventana deslizante | `6` |
+| `MAX_ATTACHMENT_CHARS` | Caracteres que se toman de cada adjunto PDF/Word | `60000` |
+| `METADATA_EXTRACTOR_MODEL` | Modelo que extrae la ficha del proyecto tras cada turno | el de `LLM_MODEL` |
 | `ESTIMADOR_API_URL` | URL de la API que usa la interfaz Streamlit (no va en `.env`: es del cliente) | `http://localhost:8000` |
 
 ## Limitaciones
 
-- Single-turn: una estimación no se refina conversando. Se cambian los parámetros y se vuelve a
-  generar.
-- La versión del prompt se elige en el código (`PROMPT_VERSION`). Todavía no hay un `v2/` ni se
-  puede elegir la versión por petición (es un bonus opcional del ejercicio).
+- Las conversaciones viven en la memoria del proceso: se pierden al reiniciar el servidor y no
+  funcionan con varios workers. Tampoco caducan: cada sesión ocupa memoria hasta el reinicio.
+- La ventana deslizante descarta los turnos antiguos sin resumirlos: lo que no haya pasado a la
+  ficha se olvida (la compresión con resumen y anclas llega en la clase en vivo).
+- Los adjuntos pierden lo visual (diagramas, imágenes) y un PDF escaneado no aporta texto (no hay
+  OCR). Solo `.pdf` y `.docx`, no el `.doc` antiguo.
+- La versión del prompt se elige en el código (`PROMPT_VERSION` para un solo turno,
+  `CONVERSATION_PROMPT_VERSION` para la conversación), no por petición.
 - `GET /api/v1/context` expone el system prompt. Aquí no es secreto (el repo es público), pero en
   producción habría que protegerlo o desactivarlo.
-- La interfaz es para demos y pruebas internas: sin autenticación ni persistencia (las
-  estimaciones se pierden al recargar la página).
+- La interfaz es para demos y pruebas internas: sin autenticación ni persistencia (al recargar
+  la página empieza otra conversación).
 - Los ejemplos de referencia son ficticios y estáticos. La calidad depende de lo representativos
   que sean.
 - La aritmética la hace el modelo: los totales de la estimación generada pueden tener errores. El
